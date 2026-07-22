@@ -1,0 +1,17 @@
+# secrets and local settings
+keys.py
+gui_settings.json
+
+# generated output and caches
+CHECKED_EDITS/
+dist/
+build/
+*.spec
+cache/
+_temp/
+__pycache__/
+*.py[cod]
+
+# editor and operating-system files
+~$*.docx
+.DS_Store
