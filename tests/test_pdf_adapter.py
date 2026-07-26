@@ -279,6 +279,10 @@ def test_detached_superscript_pairs_only_with_same_page_footnote():
         "effective_indent_left": None,
         "text": "Held.⟦FN:1⟧",
         "anchors": [{"footnote_id": 1, "offset": 5}],
+        "pdf_paragraph_source": "native",
+        "pdf_paragraph_number": None,
+        "pdf_pages": [1],
+        "pdf_proposition_limit": True,
     }]
 
 
@@ -687,7 +691,228 @@ def test_body_materialization_removes_callout_glyph_and_running_header():
         "effective_indent_left": None,
         "text": "Held⟦FN:1⟧",
         "anchors": [{"footnote_id": 1, "offset": 4}],
+        "pdf_paragraph_source": "native",
+        "pdf_paragraph_number": None,
+        "pdf_pages": [1],
+        "pdf_proposition_limit": True,
     }]
+
+
+def test_numbered_paragraph_sequence_groups_physical_lines():
+    rows = []
+    order = 0
+    for number in range(1, 6):
+        order += 1
+        rows.append({
+            "input_order": order,
+            "reading_order_index": order,
+            "pdf_page": 1,
+            "line_id": f"label-{number}",
+            "region_id": f"block-{order}",
+            "region_type": "body",
+            "raw_transcription": f"  [{number}]",
+            "line_bbox_px": {"y0": 100 + order * 20},
+            "page_height_px": 1000,
+        })
+        order += 1
+        rows.append({
+            "input_order": order,
+            "reading_order_index": order,
+            "pdf_page": 1,
+            "line_id": f"text-{number}",
+            "region_id": f"block-{order}",
+            "region_type": "body",
+            "raw_transcription": (
+                f"Substantive paragraph {number} contains enough ordinary "
+                "legal words to establish a reliable monotone sequence."
+            ),
+            "line_bbox_px": {"y0": 100 + order * 20},
+            "page_height_px": 1000,
+        })
+
+    assert pdf_adapter._annotate_numbered_paragraphs(rows) == 5
+    paragraphs = pdf_adapter._body_paragraphs(rows, [], {})
+
+    assert len(paragraphs) == 5
+    assert [item["pdf_paragraph_number"] for item in paragraphs] == [
+        1, 2, 3, 4, 5
+    ]
+    assert all(
+        item["pdf_paragraph_source"] == "numbered"
+        and item["pdf_proposition_limit"]
+        for item in paragraphs
+    )
+    assert paragraphs[0]["text"].startswith(
+        "[1] Substantive paragraph 1"
+    )
+
+
+def test_paragraph_label_span_is_not_a_footnote_reference():
+    row = {
+        "input_order": 1,
+        "reading_order_index": 1,
+        "pdf_page": 1,
+        "line_id": "paragraph",
+        "region_type": "body",
+        "raw_transcription": "[1] Paragraph text9",
+        "pdf_paragraph_label_span": [0, 3],
+        "native_superscript_spans": [[1, 2], [18, 19]],
+    }
+
+    candidates = pdf_adapter._reference_candidates([row])
+
+    assert [(item["note_id"], item["start_offset"]) for item in candidates] == [
+        ("9", 18)
+    ]
+
+
+def test_native_pdf_block_combines_lines_and_anchor_offsets():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 2,
+            "line_id": "line-1",
+            "region_id": "block-1",
+            "region_type": "body",
+            "raw_transcription": "First line",
+            "line_bbox_px": {"y0": 100},
+            "page_height_px": 1000,
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 2,
+            "line_id": "line-2",
+            "region_id": "block-1",
+            "region_type": "body",
+            "raw_transcription": "second1",
+            "line_bbox_px": {"y0": 120},
+            "page_height_px": 1000,
+        },
+    ]
+    markers = [{
+        "role": "fn_ref",
+        "safe_to_use": True,
+        "note_id": "1",
+        "materialized_pair_id": "pair-1",
+        "reading_order_index": 2,
+        "start_offset": 6,
+        "end_offset": 7,
+    }]
+
+    paragraphs = pdf_adapter._body_paragraphs(
+        rows, markers, {"pair:pair-1": 1}
+    )
+
+    assert len(paragraphs) == 1
+    assert paragraphs[0]["text"] == "First line second⟦FN:1⟧"
+    assert paragraphs[0]["anchors"] == [{
+        "footnote_id": 1,
+        "offset": len("First line second"),
+    }]
+    assert paragraphs[0]["pdf_paragraph_source"] == "native"
+
+
+def test_unreliable_line_blocks_use_unbounded_page_fallback():
+    rows = [
+        {
+            "input_order": order,
+            "reading_order_index": order,
+            "pdf_page": 1,
+            "line_id": f"line-{order}",
+            "region_id": f"block-{order}",
+            "region_type": "body",
+            "raw_transcription": f"Physical line {chr(64 + order)}",
+            "line_bbox_px": {"y0": 100 + order * 20},
+            "page_height_px": 1000,
+        }
+        for order in range(1, 9)
+    ]
+
+    paragraphs = pdf_adapter._body_paragraphs(rows, [], {})
+
+    assert len(paragraphs) == 1
+    assert paragraphs[0]["pdf_paragraph_source"] == "page"
+    assert paragraphs[0]["pdf_proposition_limit"] is False
+    assert paragraphs[0]["text"].startswith("Physical line A Physical line B")
+
+
+def test_native_pdf_block_continues_across_page_when_geometry_agrees():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 1,
+            "line_id": "page-1",
+            "region_id": "block-1",
+            "region_type": "body",
+            "raw_transcription": "The sentence continues,",
+            "line_bbox_px": {"y0": 900, "y1": 930},
+            "page_height_px": 1000,
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 2,
+            "line_id": "page-2",
+            "region_id": "block-1",
+            "region_type": "body",
+            "raw_transcription": "across the next page.",
+            "line_bbox_px": {"y0": 80, "y1": 110},
+            "page_height_px": 1000,
+        },
+    ]
+
+    paragraphs = pdf_adapter._body_paragraphs(rows, [], {})
+
+    assert len(paragraphs) == 1
+    assert paragraphs[0]["pdf_pages"] == [1, 2]
+    assert paragraphs[0]["text"] == (
+        "The sentence continues, across the next page."
+    )
+
+
+def test_pdf_paragraph_caps_context_without_changing_docx(monkeypatch):
+    import alr_quote_verifier
+
+    def proposition(*, limited, mode):
+        paragraphs = [
+            {"text": "Earlier unrelated context", "anchors": []},
+            {
+                "text": "Target proposition⟦FN:1⟧ trailing material.",
+                "anchors": [{
+                    "footnote_id": 1,
+                    "offset": len("Target proposition"),
+                }],
+                "pdf_proposition_limit": limited,
+            },
+        ]
+        global_text, _starts, anchors = alr_quote_verifier.build_global_text(
+            paragraphs
+        )
+        clean_text, raw_to_clean = (
+            alr_quote_verifier.build_clean_text_and_index_map(global_text)
+        )
+        monkeypatch.setattr(alr_quote_verifier, "PROPOSITION_MODE", mode)
+        return alr_quote_verifier.build_anchor_propositions(
+            clean_text, anchors, raw_to_clean
+        )[1]["proposition_text"]
+
+    assert proposition(
+        limited=True, mode="passage_since_prior_note"
+    ) == "Target proposition"
+    assert proposition(
+        limited=False, mode="passage_since_prior_note"
+    ) == (
+        "Earlier unrelated context Target proposition"
+    )
+    assert proposition(
+        limited=True, mode="footnote_sentence"
+    ) == "Target proposition trailing material."
+    assert proposition(
+        limited=False, mode="footnote_sentence"
+    ) == "Target proposition trailing material."
 
 
 def test_restarted_note_numbers_use_pair_ids():

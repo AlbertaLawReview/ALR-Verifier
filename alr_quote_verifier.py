@@ -2208,6 +2208,7 @@ def build_global_text(paragraphs: List[Dict[str, Any]], sep: str = "\n\n"):
     for i, p in enumerate(paragraphs):
         para_starts.append(pos)
         global_parts.append(p["text"])
+        paragraph_end = pos + len(p["text"])
 
         for a in p["anchors"]:
             anchors.append(
@@ -2216,6 +2217,11 @@ def build_global_text(paragraphs: List[Dict[str, Any]], sep: str = "\n\n"):
                     "para_index": i,
                     "para_offset": a["offset"],
                     "global_pos": pos + a["offset"],
+                    "paragraph_start": pos,
+                    "paragraph_end": paragraph_end,
+                    "limit_to_paragraph": bool(
+                        p.get("pdf_proposition_limit")
+                    ),
                 }
             )
 
@@ -5977,6 +5983,21 @@ def _sentence_bounds_smart(clean_text: str, pos: int, max_window: int = 1200) ->
     return (start, end)
 
 
+def _clean_anchor_paragraph_bounds(
+    anchor: Dict[str, Any],
+    raw_to_clean: List[int],
+) -> Optional[Tuple[int, int]]:
+    if not anchor.get("limit_to_paragraph") or not raw_to_clean:
+        return None
+    last = len(raw_to_clean) - 1
+    raw_start = max(0, min(last, int(anchor.get("paragraph_start") or 0)))
+    raw_end = max(
+        raw_start,
+        min(last, int(anchor.get("paragraph_end") or raw_start)),
+    )
+    return raw_to_clean[raw_start], raw_to_clean[raw_end]
+
+
 def build_anchor_propositions(
     clean_global: str,
     anchors: List[Dict[str, Any]],
@@ -5986,7 +6007,8 @@ def build_anchor_propositions(
 
     ``footnote_sentence`` uses sentence boundaries.
     ``passage_since_prior_note`` uses the body text between adjacent footnote
-    markers.
+    markers. PDF paragraphs with a reliable native or numbered boundary cap
+    either strategy at that paragraph.
     """
     anchors_sorted = sorted(anchors, key=lambda a: a["global_pos"])
     out: Dict[int, Dict[str, Any]] = {}
@@ -5994,7 +6016,7 @@ def build_anchor_propositions(
     intro_cut = _introduction_cutoff(clean_global)
 
     if PROPOSITION_MODE == "passage_since_prior_note":
-        ordered: List[Tuple[int, int]] = []
+        ordered: List[Tuple[int, int, Dict[str, Any]]] = []
         seen: set[int] = set()
         for a in anchors_sorted:
             fid = int(a["footnote_id"])
@@ -6002,11 +6024,17 @@ def build_anchor_propositions(
                 continue
             seen.add(fid)
             curr_raw = int(a["global_pos"])
-            ordered.append((fid, raw_to_clean[curr_raw]))
+            ordered.append((fid, raw_to_clean[curr_raw], a))
 
-        for idx, (fid, anchor_c) in enumerate(ordered):
+        for idx, (fid, anchor_c, anchor) in enumerate(ordered):
             start_c = 0 if idx == 0 else ordered[idx - 1][1]
             end_c = anchor_c
+            paragraph_bounds = _clean_anchor_paragraph_bounds(
+                anchor, raw_to_clean
+            )
+            if paragraph_bounds is not None:
+                start_c = max(start_c, paragraph_bounds[0])
+                end_c = min(end_c, paragraph_bounds[1])
             if fid == 1 and intro_cut:
                 start_c = max(start_c, intro_cut)
             if start_c >= end_c:
@@ -6045,6 +6073,13 @@ def build_anchor_propositions(
 
         if fid == 1 and intro_cut:
             start_c = max(start_c, intro_cut)
+
+        paragraph_bounds = _clean_anchor_paragraph_bounds(a, raw_to_clean)
+        if paragraph_bounds is not None:
+            start_c = max(start_c, paragraph_bounds[0])
+            end_c = min(end_c, paragraph_bounds[1])
+        if start_c >= end_c:
+            continue
 
         prop = clean_global[start_c:end_c]
         prop = re.sub(r"\s+", " ", prop).strip()

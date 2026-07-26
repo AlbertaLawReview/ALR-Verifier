@@ -12,12 +12,13 @@ carefully until it has its own corpus gate.
 from __future__ import annotations
 
 import re
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 from typing import Any, Mapping, Sequence
 
+from verifier_core import a2aj_structure
 from verifier_core.document_input import ParsedDocument
 
 
@@ -41,6 +42,12 @@ _SYMBOL_REF_RE = re.compile(
     r"(?=[\s.,;:!?)]|$)"
 )
 _STANDALONE_REF_RE = re.compile(r"(?P<value>\d{1,3}|[*\u2020\u2021\u00a7#])")
+_PARAGRAPH_LABEL_RE = re.compile(
+    r"^\s*(?:\[(?P<bracket>\d{1,4})\]"
+    r"|(?P<dot>\d{1,4})\.(?=\s|$)"
+    r"|(?P<bare>\d{1,4})(?=\s))"
+)
+_NATIVE_PARAGRAPH_LINE_SHARE = 0.50
 
 
 @dataclass(frozen=True)
@@ -480,6 +487,90 @@ def _native_superscript_spans(row: Mapping[str, Any], *, body_size: float) -> li
     return result
 
 
+def _body_rows_for_paragraphs(
+    rows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            row
+            for row in rows
+            if row.get("region_type") == "body"
+            and not row.get("exclude_from_body")
+            and not (
+                float(row.get("page_height_px") or 0) > 0
+                and float((row.get("line_bbox_px") or {}).get("y0") or 0)
+                <= float(row.get("page_height_px") or 0) * 0.05
+            )
+        ),
+        key=lambda row: int(row.get("input_order") or 0),
+    )
+
+
+def _annotate_numbered_paragraphs(rows: Sequence[dict[str, Any]]) -> int:
+    """Mark a substantive monotone paragraph sequence on body rows."""
+
+    body_rows = _body_rows_for_paragraphs(rows)
+    if not body_rows:
+        return 0
+    starts: list[int] = []
+    parts: list[str] = []
+    offset = 0
+    for row in body_rows:
+        starts.append(offset)
+        text = str(row.get("raw_transcription") or "")
+        parts.append(text)
+        offset += len(text) + 1
+    numbered = a2aj_structure.paragraph_index("\n".join(parts))
+    if not numbered:
+        return 0
+
+    start_indexes = [
+        max(0, bisect_right(starts, paragraph[1]) - 1)
+        for paragraph in numbered
+    ]
+    for index, paragraph in enumerate(numbered):
+        number, _start, end, _text = paragraph
+        start_index = start_indexes[index]
+        start_row = body_rows[start_index]
+        match = _PARAGRAPH_LABEL_RE.match(
+            str(start_row.get("raw_transcription") or "")
+        )
+        if match:
+            start_row["pdf_paragraph_label_span"] = [
+                match.start(),
+                match.end(),
+            ]
+        start_row["pdf_paragraph_sequence_start"] = True
+        start_row["pdf_paragraph_number"] = number
+
+        if index + 1 < len(numbered):
+            stop_index = start_indexes[index + 1]
+        else:
+            stop_index = bisect_left(starts, end)
+            candidate_rows = body_rows[start_index:stop_index]
+            pages = {
+                int(row.get("pdf_page") or 0) for row in candidate_rows
+            }
+            if end - paragraph[1] > 5000 or (
+                pages and max(pages) - min(pages) > 2
+            ):
+                region_id = str(start_row.get("region_id") or "")
+                stop_index = start_index + 1
+                while (
+                    stop_index < len(body_rows)
+                    and region_id
+                    and body_rows[stop_index].get("region_id") == region_id
+                    and body_rows[stop_index].get("pdf_page")
+                    == start_row.get("pdf_page")
+                ):
+                    stop_index += 1
+        key = f"numbered:{number}:{int(start_row.get('input_order') or 0)}"
+        for row in body_rows[start_index:max(start_index + 1, stop_index)]:
+            row["pdf_numbered_paragraph_key"] = key
+            row["pdf_paragraph_number"] = number
+    return len(numbered)
+
+
 def _extract_rows(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[int, float | None], int]:
     try:
         import fitz
@@ -518,6 +609,7 @@ def _extract_rows(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[int, float
         spans = _native_superscript_spans(row, body_size=body_size)
         if spans:
             row["native_superscript_spans"] = spans
+    _annotate_numbered_paragraphs(rows)
     return rows, separators, page_count
 
 
@@ -575,6 +667,7 @@ def _reference_candidates(
             })
         label_match = _NOTE_LABEL_RE.match(text)
         label_span = _label_match(label_match)[1:] if label_match else None
+        paragraph_span = tuple(row.get("pdf_paragraph_label_span") or ())
         spans: list[tuple[int, int, str]] = []
         for start, end in row.get("native_superscript_spans") or ():
             value = text[int(start):int(end)]
@@ -595,6 +688,12 @@ def _reference_candidates(
                 ))
         for start, end, value in sorted(set(spans)):
             if label_span == (start, end):
+                continue
+            if (
+                len(paragraph_span) == 2
+                and start < int(paragraph_span[1])
+                and end > int(paragraph_span[0])
+            ):
                 continue
             candidates.append({
                 "note_id": str(int(value)) if value.isdigit() else value,
@@ -913,6 +1012,67 @@ def _materialize_footnotes(
     return entries, internal_by_marker
 
 
+def _native_blocks_continue_across_page(
+    previous_rows: Sequence[Mapping[str, Any]],
+    current_rows: Sequence[Mapping[str, Any]],
+) -> bool:
+    previous = previous_rows[-1]
+    current = current_rows[0]
+    previous_page = int(previous.get("pdf_page") or 0)
+    current_page = int(current.get("pdf_page") or 0)
+    if current_page != previous_page + 1:
+        return False
+    previous_height = float(previous.get("page_height_px") or 0)
+    current_height = float(current.get("page_height_px") or 0)
+    previous_y = float((previous.get("line_bbox_px") or {}).get("y1") or 0)
+    current_y = float((current.get("line_bbox_px") or {}).get("y0") or 0)
+    if (
+        previous_height <= 0
+        or current_height <= 0
+        or previous_y < previous_height * 0.55
+        or current_y > current_height * 0.25
+    ):
+        return False
+    previous_text = str(previous.get("raw_transcription") or "").rstrip()
+    current_text = str(current.get("raw_transcription") or "").lstrip()
+    first_letter = re.search(r"[^\W\d_]", current_text)
+    return bool(
+        previous_text
+        and first_letter
+        and (
+            first_letter.group(0).islower()
+            or previous_text[-1] in "-,;:("
+        )
+    )
+
+
+def _body_row_with_anchors(
+    row: Mapping[str, Any],
+    events: Sequence[tuple[int, int, int]],
+) -> tuple[str, list[dict[str, int]]]:
+    raw_text = str(row.get("raw_transcription") or "")
+    leading = len(raw_text) - len(raw_text.lstrip())
+    text = raw_text.strip()
+    parts: list[str] = []
+    anchors: list[dict[str, int]] = []
+    cursor = 0
+    length = 0
+    for raw_start, raw_end, internal in sorted(
+        events, key=lambda item: (item[1], item[0])
+    ):
+        start = max(cursor, min(len(text), int(raw_start) - leading))
+        end = max(start, min(len(text), int(raw_end) - leading))
+        prefix = text[cursor:start]
+        parts.append(prefix)
+        length += len(prefix)
+        parts.append(f"\u27e6FN:{internal}\u27e7")
+        anchors.append({"footnote_id": internal, "offset": length})
+        length += len(parts[-1])
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts), anchors
+
+
 def _body_paragraphs(
     rows: Sequence[dict[str, Any]],
     markers: Sequence[dict[str, Any]],
@@ -922,17 +1082,7 @@ def _body_paragraphs(
         [marker for marker in markers if marker.get("role") == "fn_ref" and marker.get("safe_to_use", True)],
         key=_marker_order,
     )
-    rows_by_order = {
-        int(row.get("input_order") or 0): row
-        for row in rows
-        if row.get("region_type") == "body"
-        and not row.get("exclude_from_body")
-        and not (
-            float(row.get("page_height_px") or 0) > 0
-            and float((row.get("line_bbox_px") or {}).get("y0") or 0)
-            <= float(row.get("page_height_px") or 0) * 0.05
-        )
-    }
+    body_rows = _body_rows_for_paragraphs(rows)
     refs_by_order: dict[int, list[tuple[int, int, int]]] = {}
     for marker in refs:
         pair_id = _pair_id(marker)
@@ -949,31 +1099,106 @@ def _body_paragraphs(
         end = int(marker.get("end_offset") or start)
         refs_by_order.setdefault(order, []).append((start, end, internal))
 
+    block_counts: dict[tuple[int, str], int] = {}
+    for row in body_rows:
+        region_id = str(row.get("region_id") or "")
+        if region_id:
+            key = (int(row.get("pdf_page") or 0), region_id)
+            block_counts[key] = block_counts.get(key, 0) + 1
+    multi_line_rows = sum(
+        count for count in block_counts.values() if count > 1
+    )
+    native_reliable = (
+        len(body_rows) < 8
+        or multi_line_rows / max(1, len(body_rows))
+        >= _NATIVE_PARAGRAPH_LINE_SHARE
+    )
+
+    groups: list[dict[str, Any]] = []
+    for row in body_rows:
+        page = int(row.get("pdf_page") or 0)
+        numbered_key = str(row.get("pdf_numbered_paragraph_key") or "")
+        region_id = str(row.get("region_id") or "")
+        if numbered_key:
+            key = ("numbered", numbered_key)
+            source = "numbered"
+        elif native_reliable:
+            key = (
+                "native",
+                page,
+                region_id or f"row-{int(row.get('input_order') or 0)}",
+            )
+            source = "native"
+        else:
+            key = ("page", page)
+            source = "page"
+        if groups and groups[-1]["key"] == key:
+            groups[-1]["rows"].append(row)
+        else:
+            groups.append({"key": key, "source": source, "rows": [row]})
+
+    merged_groups: list[dict[str, Any]] = []
+    for group in groups:
+        if (
+            merged_groups
+            and group["source"] == "native"
+            and merged_groups[-1]["source"] == "native"
+            and _native_blocks_continue_across_page(
+                merged_groups[-1]["rows"], group["rows"]
+            )
+        ):
+            merged_groups[-1]["rows"].extend(group["rows"])
+        else:
+            merged_groups.append(group)
+
     paragraphs: list[dict[str, Any]] = []
-    for order in sorted(rows_by_order):
-        text = str(rows_by_order[order].get("raw_transcription") or "").strip()
-        if not text:
-            continue
-        events = sorted(refs_by_order.get(order, ()), key=lambda item: (item[1], item[0]))
+    for group in merged_groups:
         parts: list[str] = []
         anchors: list[dict[str, int]] = []
-        cursor = 0
-        for start, end, internal in events:
-            start = max(cursor, min(len(text), int(start)))
-            end = max(start, min(len(text), int(end)))
-            parts.append(text[cursor:start])
-            offset = sum(len(part) for part in parts)
-            marker = f"⟦FN:{internal}⟧"
-            parts.append(marker)
-            anchors.append({"footnote_id": internal, "offset": offset})
-            cursor = end
-        parts.append(text[cursor:])
+        length = 0
+        for row in group["rows"]:
+            order = int(row.get("input_order") or 0)
+            text, row_anchors = _body_row_with_anchors(
+                row, refs_by_order.get(order, ())
+            )
+            if not text:
+                continue
+            if parts:
+                parts.append(" ")
+                length += 1
+            parts.append(text)
+            anchors.extend(
+                {
+                    "footnote_id": anchor["footnote_id"],
+                    "offset": length + anchor["offset"],
+                }
+                for anchor in row_anchors
+            )
+            length += len(text)
+        text = "".join(parts)
+        if not text:
+            continue
+        pages = sorted({
+            int(row.get("pdf_page") or 0) for row in group["rows"]
+        })
+        paragraph_number = next(
+            (
+                int(row["pdf_paragraph_number"])
+                for row in group["rows"]
+                if row.get("pdf_paragraph_number") is not None
+            ),
+            None,
+        )
         paragraphs.append({
             "style_id": None,
             "style_name": None,
             "effective_indent_left": None,
-            "text": "".join(parts),
+            "text": text,
             "anchors": anchors,
+            "pdf_paragraph_source": group["source"],
+            "pdf_paragraph_number": paragraph_number,
+            "pdf_pages": pages,
+            "pdf_proposition_limit": group["source"] != "page",
         })
     return paragraphs
 
@@ -989,6 +1214,15 @@ def inspect_pdf(pdf_path: str | Path) -> PdfIntakeResult:
     _refine_regions_from_pairs(rows, separators, markers)
     footnotes, internal_by_marker = _materialize_footnotes(rows, markers)
     paragraphs = _body_paragraphs(rows, markers, internal_by_marker)
+    paragraph_sources: dict[str, int] = {}
+    for paragraph in paragraphs:
+        source = str(paragraph.get("pdf_paragraph_source") or "unknown")
+        paragraph_sources[source] = paragraph_sources.get(source, 0) + 1
+    summary["paragraph_count"] = len(paragraphs)
+    summary["paragraph_sources"] = paragraph_sources
+    summary["numbered_paragraph_count"] = sum(
+        bool(row.get("pdf_paragraph_sequence_start")) for row in rows
+    )
     if not footnotes:
         raise ValueError(
             "No footnote labels were detected in the PDF. "
@@ -1027,5 +1261,6 @@ def load_pdf_document(pdf_path: str | Path) -> ParsedDocument:
             "pairing_summary": result.pairing_summary,
             "pdf_line_count": len(result.rows),
             "pdf_marker_count": len(result.markers),
+            "pdf_paragraph_count": len(result.paragraphs),
         },
     )
