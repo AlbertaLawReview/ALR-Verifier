@@ -167,7 +167,7 @@ def _prefer_scc_official_quote_link(row: Dict[str, Any], link: str) -> str:
     official = str(row.get("_a2aj_source_url") or "").strip()
     locked = None
     if not reconciled and is_canlii_scc:
-        locked = _A2AJ_LOCKED_DOCUMENTS.get(link_base.lower())
+        locked = _A2AJ_LOCKED_DOCUMENTS.get(_fragment_doc_key(link_base))
         if locked:
             reconciled = True
             dataset = locked.dataset
@@ -3142,7 +3142,7 @@ def _register_a2aj_document(
     structure: Optional[Dict[str, Any]] = None,
     evidence_text: Optional[str] = None,
 ) -> None:
-    key = (base or "").lower()
+    key = _fragment_doc_key(base)
     if not key:
         return
     if evidence_text is None:
@@ -5618,8 +5618,9 @@ def build_footnote_parts(
             source_started = time.perf_counter()
             citation_part_link = _canlii_pdf_to_html_sibling(part.link)
             link_base, _link_frag = _split_url(citation_part_link or "")
-            locked_structure = _A2AJ_LOCKED_STRUCTURES.get((link_base or "").lower(), {})
-            locked_document = _A2AJ_LOCKED_DOCUMENTS.get((link_base or "").lower())
+            locked_key = _fragment_doc_key(link_base)
+            locked_structure = _A2AJ_LOCKED_STRUCTURES.get(locked_key, {})
+            locked_document = _A2AJ_LOCKED_DOCUMENTS.get(locked_key)
             a2aj_source_available = bool(locked_document and locked_document.text)
             a2aj_probe: Dict[str, Any] = {}
             has_quote_context = bool(find_inline_quotes((prop_texts or {}).get(fid, "")))
@@ -7363,8 +7364,64 @@ def _journal_db_pages_for_quote(
     return pages
 
 
+def _page_marker_pinpoint_for_quote(
+    text: str, quote_text: str, min_score: float = 0.0
+) -> str:
+    """Resolve one printed page or an adjacent-page range for a quote."""
+    spans = _journal_db_page_spans(text)
+    if not spans:
+        return ""
+
+    quote_tokens = _strip_trailing_match_punct_tokens(
+        _tokenize_quote_text(quote_text or "")
+    )
+    aliases = _quote_source_alignment_aliases(quote_tokens)
+    quote_words = [
+        _quote_source_alignment_token(token, aliases)
+        for token in quote_tokens
+        if _is_wordlike_quote_token(token)
+    ]
+    source_words: List[str] = []
+    source_pages: List[str] = []
+    for label, start, end in spans:
+        page_text = _JOURNAL_DB_PAGE_MARKER_RE.sub(
+            " ", (text or "")[start:end], count=1
+        )
+        for token in _tokenize_quote_text(page_text):
+            if not _is_wordlike_quote_token(token):
+                continue
+            source_words.append(_quote_source_alignment_token(token, aliases))
+            source_pages.append(label)
+
+    paths: set[Tuple[str, ...]] = set()
+    width = len(quote_words)
+    if width and width <= len(source_words):
+        for index in range(len(source_words) - width + 1):
+            if source_words[index:index + width] != quote_words:
+                continue
+            labels: List[str] = []
+            for label in source_pages[index:index + width]:
+                if not labels or labels[-1] != label:
+                    labels.append(label)
+            if labels:
+                paths.add(tuple(labels))
+
+    if len(paths) == 1:
+        labels = next(iter(paths))
+        if len(labels) == 1:
+            return f"page {labels[0]}"
+        if labels[0] != labels[-1]:
+            return f"pages {labels[0]}\u2013{labels[-1]}"
+        return ""
+    if paths:
+        return ""
+
+    pages = _journal_db_pages_for_quote(text, quote_text, min_score=min_score)
+    return pages[0] if len(pages) == 1 else ""
+
+
 def _page_label_from_match_pinpoint(value: str) -> Optional[int]:
-    m = re.search(r"\bpage\s+(\d{1,5})\b", value or "", flags=re.IGNORECASE)
+    m = re.search(r"\bpages?\s+(\d{1,5})\b", value or "", flags=re.IGNORECASE)
     if not m:
         return None
     try:
@@ -7943,20 +8000,21 @@ def _apply_quote_checks(
         if not anchor_text and USE_A2AJ:
             row_link = (row.get("citation_part_link") or "").strip()
             base, _fragment = _split_url(_canlii_source_lookup_url(row_link))
-            locked = _A2AJ_LOCKED_DOCUMENTS.get((base or "").lower())
+            locked_key = _fragment_doc_key(base)
+            locked = _A2AJ_LOCKED_DOCUMENTS.get(locked_key)
             if locked and locked.text:
-                locked_structure = _A2AJ_LOCKED_STRUCTURES.get((base or "").lower(), {})
+                locked_structure = _A2AJ_LOCKED_STRUCTURES.get(locked_key, {})
                 if not locked_structure:
                     _register_a2aj_document(base, locked, "law" if "/laws/" in (base or "").lower() else "case")
-                    locked_structure = _A2AJ_LOCKED_STRUCTURES.get((base or "").lower(), {})
-                anchor_text = _A2AJ_LOCKED_TEXTS.get((base or "").lower(), "")
+                    locked_structure = _A2AJ_LOCKED_STRUCTURES.get(locked_key, {})
+                anchor_text = _A2AJ_LOCKED_TEXTS.get(locked_key, "")
                 if not anchor_text:
                     anchor_text, locked_structure = _a2aj_document_evidence(
                         locked,
                         "law" if "/laws/" in (base or "").lower() else "case",
                     )
-                    _A2AJ_LOCKED_TEXTS[(base or "").lower()] = anchor_text
-                    _A2AJ_LOCKED_STRUCTURES[(base or "").lower()] = locked_structure
+                    _A2AJ_LOCKED_TEXTS[locked_key] = anchor_text
+                    _A2AJ_LOCKED_STRUCTURES[locked_key] = locked_structure
                 source_tag = "a2aj_locked"
                 row["_a2aj_identity_locked"] = True
                 row["_a2aj_url_reconciled"] = True
@@ -8227,12 +8285,13 @@ def _apply_quote_checks(
             # pinpoint/region without a nonlocal declaration on loop variables.
             nonlocal_pin = {"v": initial_source_pinpoint}
             nonlocal_region = {"v": matched_region_for_output}
-
-            if (
+            has_resolved_a2aj_labels = bool(
                 a2aj_resolution
                 and a2aj_resolution.labels
                 and not a2aj_resolution.location.startswith("scope_unavailable")
-            ):
+            )
+
+            if has_resolved_a2aj_labels:
                 labels = list(a2aj_resolution.labels)
                 resolved_pinpoints.extend(labels)
                 is_alternate = a2aj_resolution.location.startswith("alternate")
@@ -8277,25 +8336,22 @@ def _apply_quote_checks(
                     _apply_promoted(_locate_a2aj_pinpoint(
                         anchor_text, qt, source_link, locked_structure, min_score=strong_match))
 
+            if not nonlocal_pin["v"]:
+                nonlocal_pin["v"] = _page_marker_pinpoint_for_quote(
+                    journal_db_full_text or anchor_text,
+                    qt,
+                    min_score=strong_match,
+                )
+
             current_pinpoint = nonlocal_pin["v"]
             matched_region_for_output = nonlocal_region["v"]
             if source_region:
                 matched_regions.append(matched_region_for_output.replace("\n", " "))
-                if source_tag == "journal_db" and not current_pinpoint:
-                    current_pinpoint = _journal_db_page_for_region(journal_db_full_text or anchor_text, source_region)
-            if source_tag == "journal_db" and not current_pinpoint:
-                current_pinpoint = _format_pinpoint_summary(
-                    _journal_db_pages_for_quote(
-                        journal_db_full_text or anchor_text,
-                        qt,
-                        min_score=strong_match,
-                    )
-                )
             if source_tag == "journal_db" and current_pinpoint:
                 page_label = _page_label_from_match_pinpoint(current_pinpoint)
                 if page_label is not None:
                     row["quote_match_link"] = _journal_db_page_link_for_row(row, page_label)
-            if current_pinpoint and not a2aj_resolution:
+            if current_pinpoint and not has_resolved_a2aj_labels:
                 resolved_pinpoints.append(current_pinpoint)
             if source_fragment:
                 matched_source_fragments.append(source_fragment)

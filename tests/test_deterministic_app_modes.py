@@ -151,6 +151,40 @@ def test_journal_page_recovery_uses_quote_match_threshold():
     ) == ["page 449"]
 
 
+def test_page_range_link_uses_first_printed_page():
+    assert aqv._page_label_from_match_pinpoint("pages 149\u2013150") == 149
+
+
+def test_workbook_displays_cross_page_quote_range():
+    import openpyxl
+
+    row = {
+        "footnote_id": 1,
+        "footnote_display_id": "1",
+        "footnote_full": "Example footnote.",
+        "proposition_text": 'A proposition with "quoted text".',
+        "citation_part_text": "Example citation.",
+        "has_quotes": "YES",
+        "quote_check_status": "OG_PINPOINT_MATCH",
+        "quote_match_pinpoint": "pages 149\u2013150",
+        "quote_corrected_citation": '"quoted text"',
+        "citation_part_link": "https://example.test/source",
+        "pinpoint_fragments": "[]",
+        "page_pinpoints": "[]",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}\\result.xlsx"
+        aqv.write_workbook({"footnote_rows": [row]}, path)
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        sheet = workbook["FootnoteReferences"]
+        headers = [cell.value for cell in sheet[1]]
+        value = sheet.cell(2, headers.index("Corrected quote") + 1).value
+        workbook.close()
+
+    assert value.startswith("\u2713Perfect Match at pages 149\u2013150\u2713")
+    assert "[unknown]" not in value
+
+
 def test_workbook_does_not_call_populated_pinpoint_missing():
     import openpyxl
 

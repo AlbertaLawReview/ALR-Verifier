@@ -760,6 +760,85 @@ class QuoteFragmentTests(unittest.TestCase):
 
 
 
+    def test_apply_quote_checks_recovers_unique_scc_full_source_page_marker(self):
+        quote = "everyone has the right to be secure against unreasonable search or seizure"
+        rows = [{
+            "footnote_id": 72,
+            "citation_part_index": 1,
+            "citation_part_kind": "case",
+            "citation_part_link": (
+                "https://decisions.scc-csc.ca/scc-csc/scc-csc/en/item/5274/index.do"
+            ),
+            "_citation_part_full_source_text": (
+                "[Page 148]\nEarlier material.\n"
+                "[Page 149]\nSection 8 of the Charter provides:\n"
+                f"8. {quote.capitalize()}.\n"
+                "[Page 150]\nLater material."
+            ),
+        }]
+        quotes = {72: [{
+            "quote_inner": quote,
+            "quote_raw": f"\u201c{quote}\u201d",
+            "quote_delimiter_style": "CURLY",
+        }]}
+
+        with mock.patch.object(verifier, "USE_A2AJ", False):
+            verifier._apply_quote_checks(rows, quotes)
+
+        self.assertEqual(rows[0]["quote_check_status"], "OG_PINPOINT_MATCH")
+        self.assertEqual(rows[0]["quote_match_pinpoint"], "page 149")
+
+    def test_apply_quote_checks_keeps_repeated_full_source_page_match_unknown(self):
+        quote = "the repeated constitutional phrase"
+        rows = [{
+            "footnote_id": 1,
+            "citation_part_index": 1,
+            "citation_part_kind": "case",
+            "citation_part_link": "https://decisions.example.test/case",
+            "_citation_part_full_source_text": (
+                f"[Page 149]\n{quote}.\n"
+                f"[Page 150]\n{quote}."
+            ),
+        }]
+        quotes = {1: [{
+            "quote_inner": quote,
+            "quote_raw": f'"{quote}"',
+            "quote_delimiter_style": "STRAIGHT",
+        }]}
+
+        with mock.patch.object(verifier, "USE_A2AJ", False):
+            verifier._apply_quote_checks(rows, quotes)
+
+        self.assertEqual(rows[0]["quote_check_status"], "OG_PINPOINT_MATCH")
+        self.assertEqual(rows[0]["quote_match_pinpoint"], "")
+
+    def test_apply_quote_checks_reports_cross_page_full_source_range(self):
+        quote = (
+            "the constitutional guarantee protects people from unjustified "
+            "state intrusions into their private lives"
+        )
+        rows = [{
+            "footnote_id": 1,
+            "citation_part_index": 1,
+            "citation_part_kind": "case",
+            "citation_part_link": "https://decisions.example.test/case",
+            "_citation_part_full_source_text": (
+                "[Page 149]\nThe constitutional guarantee protects people from "
+                "unjustified state intrusions\n[Page 150]\ninto their private lives."
+            ),
+        }]
+        quotes = {1: [{
+            "quote_inner": quote,
+            "quote_raw": f'"{quote}"',
+            "quote_delimiter_style": "STRAIGHT",
+        }]}
+
+        with mock.patch.object(verifier, "USE_A2AJ", False):
+            verifier._apply_quote_checks(rows, quotes)
+
+        self.assertNotEqual(rows[0]["quote_check_status"], "NO_MATCH")
+        self.assertEqual(rows[0]["quote_match_pinpoint"], "pages 149\u2013150")
+
     def test_source_side_fragment_strips_canlii_section_marker(self):
         source = (
             "2 (1) A Member breaches this Act if the Member takes part in a decision "
@@ -1543,6 +1622,36 @@ class BlindFragmentBuildTests(unittest.TestCase):
         )
         base = self.FAKE_URL.split("#", 1)[0]
         self.assertEqual(verifier._A2AJ_LOCKED_DOCUMENTS[base].citation, "2099 SCC 99")
+
+    def test_registered_canlii_pdf_is_reused_by_html_quote_row(self):
+        pdf_url = (
+            "https://www.canlii.org/en/ca/scc/doc/1984/1984canlii33/"
+            "1984canlii33.pdf"
+        )
+        html_url = pdf_url.removesuffix(".pdf") + ".html"
+        document = verifier.a2aj_client.A2AJDocument(
+            dataset="SCC",
+            citation="[1984] 2 SCR 145",
+            alternate_citation="[1984] 2 SCR 145",
+            name="Hunter et al. v. Southam Inc.",
+            date="1984-09-17",
+            url=(
+                "https://decisions.scc-csc.ca/scc-csc/scc-csc/en/item/5274/"
+                "index.do"
+            ),
+            text="The decision text.",
+            language="en",
+            scraped_timestamp="",
+            upstream_license="",
+            raw={},
+        )
+
+        verifier._register_a2aj_document(pdf_url, document, "case")
+
+        self.assertIs(
+            verifier._A2AJ_LOCKED_DOCUMENTS[verifier._fragment_doc_key(html_url)],
+            document,
+        )
 
     def test_fetch_for_row_does_not_bind_text_to_mismatched_case_url(self):
         wrong_url = (
