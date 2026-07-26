@@ -86,12 +86,71 @@ def test_gui_mode_and_supra_settings_reach_engine_args():
         assert args.run_mode == run_mode
         assert args.supra_linking == "aggressive"
     assert gui._build_args(False, local_only=True).local_only is True
+    assert (
+        gui._build_args(False).proposition_mode
+        == "passage_since_prior_note"
+    )
 
     settings = gui._settings_with_defaults({
         "run_mode": "free", "supra_linking": "aggressive",
     })
     assert settings["run_mode"] == "free"
     assert settings["supra_linking"] == "aggressive"
+
+
+def test_proposition_mode_settings_validate_new_ids():
+    settings = gui._settings_with_defaults(
+        {"proposition_mode": "footnote_sentence"}
+    )
+    assert settings["proposition_mode"] == "footnote_sentence"
+
+    invalid = gui._settings_with_defaults({"proposition_mode": "unknown"})
+    assert invalid["proposition_mode"] == gui.DEFAULT_GUI_SETTINGS["proposition_mode"]
+    assert (
+        gui.PROPOSITION_MODE_BY_ID["passage_since_prior_note"]
+        == "Passage since prior note"
+    )
+    assert gui._settings_with_defaults({})["pdf_input"] is False
+
+
+def test_pdf_input_is_opt_in():
+    assert gui._is_supported_input("article.docx")
+    assert gui._is_supported_input("ARTICLE.DOCX")
+    assert not gui._is_supported_input("article.pdf")
+    assert gui._is_supported_input("ARTICLE.PDF", allow_pdf=True)
+
+
+def test_add_paths_rejects_pdf_while_setting_is_off(monkeypatch):
+    file_listbox = Mock()
+    file_listbox.size.return_value = 0
+    stub = SimpleNamespace(
+        pdf_input_var=SimpleNamespace(get=lambda: False),
+        files=[],
+        file_listbox=file_listbox,
+        _update_file_count=Mock(),
+    )
+    monkeypatch.setattr(gui.os.path, "isfile", lambda _path: True)
+
+    with patch.object(gui.messagebox, "showinfo") as showinfo:
+        gui.ALRQuoteVerifierGUI._add_paths(
+            stub, ["article.pdf", "article.docx"]
+        )
+
+    assert stub.files == ["article.docx"]
+    showinfo.assert_called_once()
+
+
+def test_run_rejects_loaded_pdf_when_setting_is_off():
+    stub = SimpleNamespace(
+        running=False,
+        files=["article.pdf"],
+        pdf_input_var=SimpleNamespace(get=lambda: False),
+    )
+
+    with patch.object(gui.messagebox, "showwarning") as showwarning:
+        gui.ALRQuoteVerifierGUI._run(stub)
+
+    assert showwarning.call_args.args[0] == "PDF input disabled"
 
 
 def test_gui_keeps_source_apis_enabled():
@@ -204,6 +263,118 @@ def test_first_local_only_toggle_offers_install_and_leaves_toggle_off():
     )
 
 
+def test_a2aj_corpus_button_routes_check_and_update_separately():
+    button = Mock()
+    installed_statuses = (
+        SimpleNamespace(installed=True, size=10, stale=False),
+        SimpleNamespace(installed=True, size=20, stale=False),
+    )
+    check = Mock()
+    install = Mock()
+    fallback = Mock()
+    stub = SimpleNamespace(
+        _a2aj_installing=False,
+        _a2aj_statuses=lambda: installed_statuses,
+        local_only_var=SimpleNamespace(get=lambda: False, set=Mock()),
+        a2aj_corpus_btn=button,
+        a2aj_corpus_status_var=Mock(),
+        _format_gb=lambda size: str(size),
+        _check_a2aj_updates=check,
+        _start_a2aj_install=install,
+        _install_or_cancel_a2aj=fallback,
+        _apply_local_only_ui=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._refresh_a2aj_corpus_ui(stub)
+    button.config.call_args.kwargs["command"]()
+    check.assert_called_once_with(manual=True)
+
+    stale_statuses = tuple(
+        SimpleNamespace(installed=True, size=10, stale=True)
+        for _ in range(2)
+    )
+    gui.ALRQuoteVerifierGUI._refresh_a2aj_corpus_ui(stub, stale_statuses)
+    assert button.config.call_args.kwargs["command"] is install
+
+
+def test_manual_a2aj_update_check_works_in_local_only_and_shows_busy_state():
+    corpus = Mock()
+    corpus.check_for_updates.side_effect = ["cases", "laws"]
+    stub = SimpleNamespace(
+        _a2aj_installing=False,
+        _a2aj_checking=False,
+        local_only_var=SimpleNamespace(get=lambda: True),
+        _a2aj_corpus_installed=lambda: True,
+        a2aj_corpus_btn=Mock(),
+        a2aj_corpus_status_var=Mock(),
+        root=SimpleNamespace(after=Mock()),
+        _finish_a2aj_update_check=Mock(),
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    with patch.object(
+        gui.aqv.a2aj_client, "get_local_corpus", return_value=corpus
+    ), patch.object(gui.threading, "Thread", ImmediateThread):
+        gui.ALRQuoteVerifierGUI._check_a2aj_updates(stub, manual=True)
+
+    stub.a2aj_corpus_status_var.set.assert_called_once_with(
+        "Checking for updates…"
+    )
+    stub.a2aj_corpus_btn.config.assert_called_once_with(state=gui.tk.DISABLED)
+    stub.root.after.assert_called_once_with(
+        0, stub._finish_a2aj_update_check, ("cases", "laws"), ""
+    )
+
+
+def test_automatic_a2aj_update_check_skips_local_only():
+    stub = SimpleNamespace(
+        _a2aj_installing=False,
+        _a2aj_checking=False,
+        local_only_var=SimpleNamespace(get=lambda: True),
+        _a2aj_corpus_installed=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._check_a2aj_updates(stub)
+
+    stub._a2aj_corpus_installed.assert_not_called()
+
+
+def test_clean_a2aj_update_check_reports_up_to_date():
+    statuses = tuple(
+        SimpleNamespace(installed=True, size=10, stale=False)
+        for _ in range(2)
+    )
+    stub = SimpleNamespace(
+        _a2aj_checking=True,
+        _format_gb=lambda size: f"{size} bytes",
+        _refresh_a2aj_corpus_ui=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._finish_a2aj_update_check(stub, statuses, "")
+
+    stub._refresh_a2aj_corpus_ui.assert_called_once_with(
+        statuses, "Installed · 20 bytes · up to date"
+    )
+
+
+def test_pdf_input_hint_has_fixed_text_choices():
+    hint = SimpleNamespace(set=Mock())
+    stub = SimpleNamespace(
+        input_hint_var=hint,
+        pdf_input_var=SimpleNamespace(get=lambda: True),
+    )
+
+    gui.ALRQuoteVerifierGUI._refresh_input_hint(stub)
+
+    hint.set.assert_called_once_with("Open PDF or .docx")
+
+
 def test_a2aj_install_clears_cache_after_each_completed_corpus():
     snapshots = (
         SimpleNamespace(kind="cases", size=10),
@@ -218,6 +389,7 @@ def test_a2aj_install_clears_cache_after_each_completed_corpus():
         _a2aj_installing=False,
         _a2aj_corpus_installed=lambda: True,
         _a2aj_cancel=cancel,
+        _install_or_cancel_a2aj=Mock(),
         a2aj_corpus_btn=Mock(),
         a2aj_corpus_status_var=Mock(),
         root=SimpleNamespace(after=Mock()),
@@ -241,6 +413,10 @@ def test_a2aj_install_clears_cache_after_each_completed_corpus():
 
     assert corpus.install_or_update.call_count == 2
     clear.assert_called_once_with()
+    assert (
+        stub.a2aj_corpus_btn.config.call_args.kwargs["command"]
+        is stub._install_or_cancel_a2aj
+    )
 
 
 def test_cli_smoke_hook_runs_engine_and_counts_live_transport_calls(capsys):

@@ -562,10 +562,17 @@ class LocalA2AJCorpus:
                         {column: _json_value(item) for column, item in zip(columns, row)}
                         for row in cursor.fetchall()
                     )
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = cache_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, cache_path)
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = cache_path.with_suffix(".tmp")
+                temporary.write_text(
+                    json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+                )
+                os.replace(temporary, cache_path)
+            except OSError:
+                # The cache is optional; a read-only or temporarily locked
+                # cache must not turn a successful local lookup into an error.
+                pass
             return rows
 
     def _ensure_lookup_index(self, kind: str) -> Path:

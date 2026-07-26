@@ -36,6 +36,25 @@ class DeterministicSplitterTests(unittest.TestCase):
             "citing Lyons, supra note 243 at page 339.",
         ])
 
+    def test_free_splits_reporter_disposition_abbreviations(self):
+        for signal in (
+            "rev'g", "rev\u2019g", "rev'd", "rev\u2019d",
+            "aff'g", "aff\u2019g", "aff'd", "aff\u2019d",
+            "cited by",
+        ):
+            with self.subTest(signal=signal):
+                text = f"R v First, 2020 SCC 1 {signal} R v Second, 2021 SCC 2."
+                expected = [
+                    "R v First, 2020 SCC 1",
+                    f"{signal} R v Second, 2021 SCC 2.",
+                ]
+                for splitter in (split_footnote, split_footnote_recall_first):
+                    with self.subTest(splitter=splitter.__name__):
+                        result = splitter(text)
+                        self.assertEqual(
+                            [part.text for part in result.parts], expected
+                        )
+
     def test_free_splits_new_citation_sentence_but_keeps_introductory_prose(self):
         text = (
             "Groia v. Law Society of Upper Canada, 2018 SCC 27, [2018] 1 SCR 772 "

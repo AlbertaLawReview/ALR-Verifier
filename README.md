@@ -2,9 +2,9 @@
 
 ALR Quote Verifier reads footnotes from Microsoft Word documents, separates
 their citations, resolves supported sources, checks quoted text, and produces
-an Excel workbook for human review. Canadian cases, legislation, and ALR journal
+an Excel workbook for human review. Canadian cases, legislation, and ALR journal 
 articles get linked automatically, including a direct link right to the relevant
-page, paragraph, or section where possible. Using [A2AJ's free API](https://a2aj.ca/data/), quotes get checked against their sources:
+page, paragraph, or section where possible. Using [A2AJ's free API](https://a2aj.ca/data/), quotes get checked against their sources: 
 you can see if the supplied quote matches the source, and whether it's at the pinpoint specified,
 or at a different pinpoint. If it's partially matching, you see what parts of the quote were changed.
 This save enormous time in the law review editing process, and may assist other legal research
@@ -33,6 +33,11 @@ On macOS or Linux, activate the environment with
 source .venv/bin/activate. Add or drag one or more DOCX files into the window,
 choose the settings, and press Run. Review workbooks are written to
 CHECKED_EDITS by default.
+
+PDF intake is experimental on this branch. It uses a self-contained,
+deterministic PyMuPDF module for native text and footnote pairing. Enable it
+under **Settings → Advanced → Enable experimental PDF input**. PDFs with
+unusual layouts should be reviewed carefully.
 
 An OpenAI API key is required for modes that use AI. Enter it when prompted or
 set OPENAI_API_KEY. A key entered in the Windows application is encrypted for

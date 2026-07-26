@@ -352,7 +352,7 @@ class A2AJClient:
     ) -> A2AJLookup:
         result = self.fetch(citation, doc_type, section=section, output_language=output_language)
         if result.get("http_status") is None:
-            return A2AJLookup("network_error")
+            return A2AJLookup("not_found" if self.local_only else "network_error")
         payload = result.get("json") or {}
         candidates = payload.get("results") or [] if isinstance(payload, dict) else []
         literal_key = _citation_literal_key(citation)

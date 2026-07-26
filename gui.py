@@ -42,6 +42,16 @@ def _asset_path(name: str) -> str:
     return str(base / "assets" / name)
 
 
+def _is_supported_input(path: str, *, allow_pdf: bool = False) -> bool:
+    suffix = Path(path).suffix.casefold()
+    return suffix == ".docx" or (allow_pdf and suffix == ".pdf")
+
+
+def _pdf_input_enabled(app) -> bool:
+    var = getattr(app, "pdf_input_var", None)
+    return bool(var and var.get())
+
+
 # ---------------------------------------------------------------------------
 # Brand palette (matches assets/app_icon.ico)
 # ---------------------------------------------------------------------------
@@ -101,6 +111,15 @@ RUN_MODE_BY_ID = {v: k for k, v in RUN_MODE_LABELS.items()}
 SUPRA_LINKING_LABELS = {"Safe": "safe", "Aggressive": "aggressive"}
 SUPRA_LINKING_BY_ID = {v: k for k, v in SUPRA_LINKING_LABELS.items()}
 VALID_FRAGMENT_MODES = {"all", "pinpointless", "off"}
+VALID_PROPOSITION_MODES = {
+    "footnote_sentence",
+    "passage_since_prior_note",
+}
+PROPOSITION_MODE_LABELS = {
+    "Footnote sentence": "footnote_sentence",
+    "Passage since prior note": "passage_since_prior_note",
+}
+PROPOSITION_MODE_BY_ID = {v: k for k, v in PROPOSITION_MODE_LABELS.items()}
 VALID_EXPORT_DETAILS = {"display", "display-json", "diagnostic-hidden", "diagnostic"}
 EXPORT_DETAIL_LABELS = {
     "Display rows only": "display",
@@ -125,7 +144,9 @@ PARALLEL_LABELS = {
 PARALLEL_BY_ID = {v: k for k, v in PARALLEL_LABELS.items()}
 
 # Bumped when a default flips so existing settings files can be migrated.
-_SETTINGS_REV = 2
+# rev 3: restore the quote/proposition context strategy setting.
+# rev 4: make experimental PDF input explicitly opt-in.
+_SETTINGS_REV = 4
 
 DEFAULT_GUI_SETTINGS = {
     "settings_rev": _SETTINGS_REV,
@@ -134,6 +155,8 @@ DEFAULT_GUI_SETTINGS = {
     "supra_linking": "safe",
     "llm_cache": True,
     "frag_mode": "all",
+    "proposition_mode": "passage_since_prior_note",
+    "pdf_input": False,
     "a2aj": True,
     "local_only": False,
     "us_uk_case_lookup": True,
@@ -160,6 +183,8 @@ def _settings_with_defaults(settings: dict | None) -> dict:
         merged["supra_linking"] = "safe"
     if merged["frag_mode"] not in VALID_FRAGMENT_MODES:
         merged["frag_mode"] = DEFAULT_GUI_SETTINGS["frag_mode"]
+    if merged["proposition_mode"] not in VALID_PROPOSITION_MODES:
+        merged["proposition_mode"] = DEFAULT_GUI_SETTINGS["proposition_mode"]
     if settings and "export_detail" not in settings and "hide_debug_cols" in settings:
         merged["export_detail"] = "diagnostic-hidden" if settings.get("hide_debug_cols", True) else "diagnostic"
     if merged["export_detail"] not in VALID_EXPORT_DETAILS:
@@ -291,6 +316,7 @@ def _build_args(
     use_a2aj: bool = True,
     use_db_search: bool = True,
     text_fragment_mode: str = "all",
+    proposition_mode: str = "passage_since_prior_note",
     export_detail: str = "diagnostic-hidden",
     llm_cache: bool = True,
     run_mode: str = "high_accuracy",
@@ -309,6 +335,7 @@ def _build_args(
         use_db_search=use_db_search,
         use_a2aj=use_a2aj,
         text_fragment_mode=text_fragment_mode,
+        proposition_mode=proposition_mode,
         export_detail=export_detail,
         no_hidden_columns=False,
         no_llm_cache=not llm_cache,
@@ -1301,9 +1328,11 @@ class ALRQuoteVerifierGUI:
             self._drop_hint, text="⬇", bg="white", fg=GREEN_SOFT,
             font=("Segoe UI", 30),
         ).pack()
+        self.input_hint_var = tk.StringVar(value="Open .docx")
         tk.Label(
             self._drop_hint,
-            text="Add .docx files to get started",
+            textvariable=self.input_hint_var,
+            width=22,
             bg="white", fg=MUTED, font=("Segoe UI Semibold", 10),
         ).pack(pady=(2, 0))
         # Clicking the empty-state hint opens the file picker.
@@ -1775,6 +1804,13 @@ class ALRQuoteVerifierGUI:
         # --- Advanced group ---
         self.llm_cache_var = tk.BooleanVar(value=True)
         self.frag_mode_var = tk.StringVar(value=DEFAULT_GUI_SETTINGS["frag_mode"])
+        self.proposition_mode_var = tk.StringVar(
+            value=PROPOSITION_MODE_BY_ID[DEFAULT_GUI_SETTINGS["proposition_mode"]]
+        )
+        self.pdf_input_var = tk.BooleanVar(value=DEFAULT_GUI_SETTINGS["pdf_input"])
+        self.pdf_input_var.trace_add(
+            "write", lambda *_: self._refresh_input_hint()
+        )
         self.fn_filter_var = tk.StringVar()
         self.term_only_var = tk.BooleanVar(value=False)
         adv_card = self._grid_group(right, "Advanced")
@@ -1792,21 +1828,47 @@ class ALRQuoteVerifierGUI:
             "“pinpointless” only adds them to citations without a "
             "paragraph pinpoint; “off” disables them.",
         ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(adv_card, text="Footnote filter:", style="Card.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(adv_card, text="Quote context:", style="Card.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        proposition_row = ttk.Frame(adv_card, style="Card.TFrame")
+        proposition_row.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+        ttk.Combobox(
+            proposition_row, textvariable=self.proposition_mode_var,
+            values=tuple(PROPOSITION_MODE_LABELS), width=24, state="readonly",
+        ).pack(side=tk.LEFT)
+        _info_dot(
+            proposition_row,
+            "Controls how much article text appears in the quote/proposition field. "
+            "Footnote sentence uses one sentence around the footnote marker. "
+            "Passage since prior note uses all body text since the previous marker.",
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(adv_card, text="Footnote filter:", style="Card.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
         fn_row = ttk.Frame(adv_card, style="Card.TFrame")
-        fn_row.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+        fn_row.grid(row=2, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
         ttk.Entry(fn_row, textvariable=self.fn_filter_var, width=16).pack(side=tk.LEFT)
         _info_dot(fn_row, "Only process these footnotes, e.g. 1,4,10-12. Leave empty for all.").pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(
             adv_card, text="Cache model responses (LLM cache)",
             variable=self.llm_cache_var, style="Card.TCheckbutton",
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        advanced_flags = ttk.Frame(adv_card, style="Card.TFrame")
+        advanced_flags.grid(
+            row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0)
+        )
         ttk.Checkbutton(
-            adv_card, text="Log to terminal only (quiet GUI log)",
+            advanced_flags, text="Log to terminal only",
             variable=self.term_only_var, style="Card.TCheckbutton",
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            advanced_flags, text="Enable experimental PDF input",
+            variable=self.pdf_input_var, style="Card.TCheckbutton",
+        ).pack(side=tk.LEFT, padx=(16, 0))
+        _info_dot(
+            advanced_flags,
+            "Allows PDF files to be added and verified directly. "
+            "Leave this off for the standard DOCX workflow.",
+        ).pack(side=tk.LEFT, padx=(6, 0))
         detail_row = ttk.Frame(adv_card, style="Card.TFrame")
-        detail_row.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        detail_row.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         ttk.Checkbutton(
             detail_row, text="Show the raw engine log in Activity",
             variable=self.detail_log_var, style="Card.TCheckbutton",
@@ -2165,22 +2227,36 @@ class ALRQuoteVerifierGUI:
             label = "Not installed · approximately 4.9 GB"
         self.a2aj_corpus_status_var.set(label)
         if not self._a2aj_installing:
-            stale = remote_statuses and any(status.stale for status in remote_statuses)
+            stale = bool(remote_statuses and any(status.stale for status in remote_statuses))
+            if installed:
+                button_text = "Update…" if stale else "Check for updates…"
+                button_command = (
+                    self._start_a2aj_install
+                    if stale
+                    else lambda: self._check_a2aj_updates(manual=True)
+                )
+            else:
+                button_text = "Install…"
+                button_command = self._install_or_cancel_a2aj
             self.a2aj_corpus_btn.config(
-                text=("Update…" if stale else "Check for updates…")
-                if installed else "Install…",
+                text=button_text,
+                command=button_command,
                 state=tk.NORMAL,
             )
         if not installed and self.local_only_var.get():
             self.local_only_var.set(False)
         self._apply_local_only_ui()
 
-    def _check_a2aj_updates(self):
-        if (self._a2aj_installing or self._a2aj_checking
-                or self.local_only_var.get() or not self._a2aj_corpus_installed()):
+    def _check_a2aj_updates(self, manual=False):
+        if self._a2aj_installing or self._a2aj_checking:
+            return
+        if not manual and self.local_only_var.get():
+            return
+        if not self._a2aj_corpus_installed():
             return
         self._a2aj_checking = True
         self.a2aj_corpus_status_var.set("Checking for updates…")
+        self.a2aj_corpus_btn.config(state=tk.DISABLED)
 
         def worker():
             try:
@@ -2200,6 +2276,8 @@ class ALRQuoteVerifierGUI:
 
     def _finish_a2aj_update_check(self, statuses, message):
         self._a2aj_checking = False
+        if statuses is not None and not any(status.stale for status in statuses):
+            message = f"Installed · {self._format_gb(sum(s.size for s in statuses))} · up to date"
         self._refresh_a2aj_corpus_ui(statuses, message)
 
     def _offer_local_corpus_install(self) -> bool:
@@ -2281,7 +2359,11 @@ class ALRQuoteVerifierGUI:
         self._a2aj_installing = True
         self._enable_local_only_after_install = bool(enable_local_only)
         self._a2aj_cancel.clear()
-        self.a2aj_corpus_btn.config(text="Cancel", state=tk.NORMAL)
+        self.a2aj_corpus_btn.config(
+            text="Cancel",
+            command=self._install_or_cancel_a2aj,
+            state=tk.NORMAL,
+        )
         self.a2aj_corpus_status_var.set("Reading current A2AJ inventory…")
 
         def worker():
@@ -2351,9 +2433,18 @@ class ALRQuoteVerifierGUI:
 
     def _add_paths(self, paths):
         added = 0
+        blocked_pdf = 0
+        allow_pdf = _pdf_input_enabled(self)
         for p in paths:
             p = (p or "").strip()
-            if p.lower().endswith(".docx") and os.path.isfile(p) and p not in self.files:
+            if Path(p).suffix.casefold() == ".pdf" and not allow_pdf:
+                blocked_pdf += 1
+                continue
+            if (
+                _is_supported_input(p, allow_pdf=allow_pdf)
+                and os.path.isfile(p)
+                and p not in self.files
+            ):
                 self.files.append(p)
                 idx = self.file_listbox.size()
                 self.file_listbox.insert(tk.END, f"  {os.path.basename(p)}")
@@ -2362,6 +2453,12 @@ class ALRQuoteVerifierGUI:
                 added += 1
         if added:
             self._update_file_count()
+        if blocked_pdf:
+            messagebox.showinfo(
+                "PDF input disabled",
+                "Enable experimental PDF input in Settings → Advanced "
+                "before adding PDF files.",
+            )
 
     def _on_drop(self, paths):
         if self.running:
@@ -2373,9 +2470,21 @@ class ALRQuoteVerifierGUI:
         self._add_paths(paths)
 
     def _add_files(self):
+        if _pdf_input_enabled(self):
+            filetypes = [
+                ("Word and PDF documents", ("*.docx", "*.pdf")),
+                ("Word Documents", "*.docx"),
+                ("PDF Documents", "*.pdf"),
+                ("All Files", "*.*"),
+            ]
+        else:
+            filetypes = [
+                ("Word Documents", "*.docx"),
+                ("All Files", "*.*"),
+            ]
         paths = filedialog.askopenfilenames(
-            title="Select .docx files",
-            filetypes=[("Word Documents", "*.docx"), ("All Files", "*.*")],
+            title="Select document files",
+            filetypes=filetypes,
         )
         self._add_paths(paths)
 
@@ -2413,6 +2522,11 @@ class ALRQuoteVerifierGUI:
         except Exception:
             pass
 
+    def _refresh_input_hint(self):
+        self.input_hint_var.set(
+            "Open PDF or .docx" if _pdf_input_enabled(self) else "Open .docx"
+        )
+
     def _open_output_folder(self):
         folder = Path(_default_output_folder())
         try:
@@ -2432,6 +2546,13 @@ class ALRQuoteVerifierGUI:
         )
         self.llm_cache_var.set(bool(s["llm_cache"]))
         self.frag_mode_var.set(s["frag_mode"])
+        self.proposition_mode_var.set(
+            PROPOSITION_MODE_BY_ID.get(
+                s["proposition_mode"],
+                PROPOSITION_MODE_BY_ID[DEFAULT_GUI_SETTINGS["proposition_mode"]],
+            )
+        )
+        self.pdf_input_var.set(bool(s["pdf_input"]))
         self.us_uk_case_lookup_var.set(bool(s["us_uk_case_lookup"]))
         self.a2aj_var.set(bool(s["a2aj"]))
         self.local_only_var.set(
@@ -2470,6 +2591,7 @@ class ALRQuoteVerifierGUI:
         vars = [
             self.run_mode_var, self.supra_linking_var,
             self.llm_cache_var, self.frag_mode_var,
+            self.proposition_mode_var, self.pdf_input_var,
             self.a2aj_var, self.local_only_var,
             self.open_after_var, self.open_folder_var, self.export_detail_var,
             self.term_only_var, self.detail_log_var, self.parallel_var,
@@ -2489,6 +2611,11 @@ class ALRQuoteVerifierGUI:
             ),
             "llm_cache": self.llm_cache_var.get(),
             "frag_mode": self.frag_mode_var.get(),
+            "proposition_mode": PROPOSITION_MODE_LABELS.get(
+                self.proposition_mode_var.get(),
+                DEFAULT_GUI_SETTINGS["proposition_mode"],
+            ),
+            "pdf_input": self.pdf_input_var.get(),
             "a2aj": self.a2aj_var.get(),
             "local_only": self.local_only_var.get(),
             "us_uk_case_lookup": self.us_uk_case_lookup_var.get(),
@@ -2813,7 +2940,8 @@ class ALRQuoteVerifierGUI:
             "Add or drag .docx files into the window and press Run "
             "verification. For each document you get an Excel workbook in the "
             "CHECKED_EDITS folder with suggested citation links, corrections, "
-            "and quotation checks.",
+            "and quotation checks. Experimental PDF input can be enabled under "
+            "Settings → Advanced.",
         )
 
         foot = ttk.Frame(dlg, padding=(16, 8, 16, 12), style="Card.TFrame")
@@ -2927,8 +3055,21 @@ class ALRQuoteVerifierGUI:
         if self.running:
             return
 
-        docx_files = [p for p in self.files if p.lower().endswith(".docx")]
-        if not docx_files:
+        allow_pdf = _pdf_input_enabled(self)
+        disabled_pdfs = [
+            p for p in self.files if Path(p).suffix.casefold() == ".pdf"
+        ]
+        if disabled_pdfs and not allow_pdf:
+            messagebox.showwarning(
+                "PDF input disabled",
+                "Enable experimental PDF input in Settings → Advanced "
+                "or remove the PDF files before running.",
+            )
+            return
+        input_files = [
+            p for p in self.files if _is_supported_input(p, allow_pdf=allow_pdf)
+        ]
+        if not input_files:
             messagebox.showwarning("No files", "Please add at least one .docx file.")
             return
 
@@ -2967,6 +3108,10 @@ class ALRQuoteVerifierGUI:
             use_a2aj=self.a2aj_var.get(),
             use_db_search=use_db_search,
             text_fragment_mode=self.frag_mode_var.get(),
+            proposition_mode=PROPOSITION_MODE_LABELS.get(
+                self.proposition_mode_var.get(),
+                DEFAULT_GUI_SETTINGS["proposition_mode"],
+            ),
             export_detail=EXPORT_DETAIL_LABELS.get(
                 self.export_detail_var.get(),
                 DEFAULT_GUI_SETTINGS["export_detail"],
@@ -2989,7 +3134,7 @@ class ALRQuoteVerifierGUI:
         self._slots = None
         self._slots_extra_pending = 0
         self._extra_released = 0
-        self._setup_run_views([Path(p).name for p in docx_files])
+        self._setup_run_views([Path(p).name for p in input_files])
         self.status_main_var.set("Starting…")
         self.status_sub_var.set("")
         self.progress.config(value=0)
@@ -3006,11 +3151,11 @@ class ALRQuoteVerifierGUI:
         )
         threading.Thread(
             target=self._run_worker,
-            args=(out_folder, docx_files, *worker_settings),
+            args=(out_folder, input_files, *worker_settings),
             daemon=True).start()
 
     def _run_worker(
-        self, out_folder, docx_files, fn_ids_raw, requested_cap,
+        self, out_folder, input_files, fn_ids_raw, requested_cap,
         quiet_log, open_after, open_folder,
     ):
         old_stdout = sys.stdout
@@ -3029,11 +3174,11 @@ class ALRQuoteVerifierGUI:
             # documents with the same stem from claiming one output path.
             jobs = []
             reserved: set[str] = set()
-            for i, docx_path in enumerate(docx_files):
+            for i, input_path in enumerate(input_files):
                 out_name, out_path = self._reserve_out_path(
-                    out_folder, docx_path, reserved)
+                    out_folder, input_path, reserved)
                 reserved.add(out_path.lower())
-                jobs.append((self.doc_views[i], docx_path, out_path, out_name))
+                jobs.append((self.doc_views[i], input_path, out_path, out_name))
 
             total = len(jobs)
             requested = min(requested_cap, total)
@@ -3099,10 +3244,10 @@ class ALRQuoteVerifierGUI:
             self.root.after(0, self._finish_run)
 
     @staticmethod
-    def _reserve_out_path(out_folder, docx_path, reserved):
+    def _reserve_out_path(out_folder, input_path, reserved):
         """Pick a workbook name that collides neither with disk nor with a
         name already promised to another article in this batch."""
-        stem = Path(docx_path).stem
+        stem = Path(input_path).stem
         base_stem = f"[CHECKED] {stem}"
         out_name = f"{base_stem}.xlsx"
         out_path = os.path.join(out_folder, out_name)
@@ -3135,7 +3280,7 @@ class ALRQuoteVerifierGUI:
             return 1
 
     def _verify_one(
-        self, dv, docx_path, out_path, out_name, fn_ids, results, open_after,
+        self, dv, input_path, out_path, out_name, fn_ids, results, open_after,
     ):
         """One article end to end, on its own worker thread."""
         self._slots.acquire()
@@ -3145,7 +3290,7 @@ class ALRQuoteVerifierGUI:
             self._pause_gate()
             self.root.after(0, self._log, f"▸ {dv.name}\n", "head", dv)
             actual_out_path = run_audit(
-                docx_path, out_path, max_lookahead=400, footnote_ids=fn_ids)
+                input_path, out_path, max_lookahead=400, footnote_ids=fn_ids)
             results[dv.index] = (True, actual_out_path or out_path)
             self.root.after(0, self._log, f"✓ {out_name}\n", "ok", dv)
             if open_after:

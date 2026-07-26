@@ -66,8 +66,9 @@ _SOURCE_SIGNAL_RE = re.compile(
     r"(?:"
     r"(?<=[.!?])\s+(?P<sentence>(?:but\s+)?see(?:\s+also|\s+generally)?|"
     r"cf\.?|compare|contra)\b"
-    r"|\b(?P<inline>citing|quoting|quoted\s+in|discussing|discussed\s+in|"
-    r"applying|applied\s+in|relying\s+on|relied\s+on|following|followed\s+in)\b"
+    r"|\b(?P<inline>citing|cited\s+(?:in|by)|quoting|quoted\s+in|"
+    r"discussing|discussed\s+in|applying|applied\s+in|relying\s+on|"
+    r"relied\s+on|following|followed\s+in|rev[’']?[dg]|aff[’']?[dg])\b"
     r")",
     re.I,
 )
@@ -102,11 +103,11 @@ _EDITORIAL_BRACKET_RE = re.compile(
 )
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?]\s+(?=[(\[\"'\u2018\u201c]*[A-Z])")
 _AGGRESSIVE_SIGNAL_RE = re.compile(
-    r"\b(?:citing|(?:as\s+)?cited\s+in|quoting|quoted\s+in|discussing|"
+    r"\b(?:citing|(?:as\s+)?cited\s+(?:in|by)|quoting|quoted\s+in|discussing|"
     r"(?:as\s+)?discussed(?:\s+e\.?g\.?)?\s+in|"
     r"applying|applied\s+in|relying\s+on|relied\s+on|following|followed\s+in|"
     r"adopting|adopted\s+in|(?:as\s+)?amended\s+by|amending|adding|"
-    r"rev[’']?d|reversed\s+by|aff[’']?d|affirmed\s+by|penalty\s+at|"
+    r"rev[’']?[dg]|reversed\s+by|aff[’']?[dg]|affirmed\s+by|penalty\s+at|"
     r"republished\b[^.;]{0,100}\bin|accord|but\s+see|contra|compare|cf\.?|see(?:\s+also|"
     r"\s+generally|\s*,?\s*e\.?g\.?)?)\b",
     re.I,

@@ -85,6 +85,23 @@ def test_incremental_atomic_update_and_exact_lookup(tmp_path):
     assert corpus.status("cases").installed is False
 
 
+def test_exact_lookup_survives_unwritable_query_cache(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    parquet = source / "case.parquet"
+    item = _parquet(parquet, "2024 SCC 1", "First Case", "first text")
+    corpus = CopyingCorpus(tmp_path / "corpus", {item.sha256: parquet})
+    remote = RemoteSnapshot("cases", "a2aj/test", "rev-1", "2026-01-01", (item,))
+    corpus.install_or_update("cases", remote=remote)
+
+    with mock.patch(
+        "pathlib.Path.write_text", side_effect=PermissionError("read-only cache")
+    ):
+        result = corpus.fetch("2024 SCC 1", "cases")
+
+    assert result["json"]["results"][0]["unofficial_text_en"] == "first text"
+
+
 def test_unchanged_inventory_migrates_stale_lookup_index(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -244,6 +261,28 @@ def test_client_prefers_local_corpus_and_local_only_fails_closed(tmp_path, monke
     )
     assert client.lookup("2024 SCC 1", "cases").document.text == "local text"
     assert client.lookup("2099 SCC 99", "cases").status == "not_found"
+
+
+def test_local_only_never_reports_a_network_error_for_local_failure(
+    tmp_path, monkeypatch
+):
+    class BrokenCorpus:
+        def fetch(self, *_args, **_kwargs):
+            raise OSError("local cache unavailable")
+
+    monkeypatch.setattr(
+        a2aj_client,
+        "_http_get",
+        lambda *_args, **_kwargs: pytest.fail("network request attempted"),
+    )
+    client = a2aj_client.A2AJClient(
+        cache_dir=str(tmp_path),
+        local_corpus=BrokenCorpus(),
+        local_only=True,
+        min_seconds_between_requests=0,
+    )
+
+    assert client.lookup("2024 SCC 1", "cases").status == "not_found"
 
 
 def test_exact_lookup_uses_json_cache_before_duckdb_or_index(tmp_path):

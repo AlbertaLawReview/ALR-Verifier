@@ -3,7 +3,7 @@
 """ALR Footnote + Quote Verification (local runner)
 
 What this does
-- Extracts footnotes from a DOCX.
+- Extracts footnotes from a DOCX or experimental PDF input.
 - Splits multi-citation footnotes using an OpenAI model.
 - Resolves ibid/supra chains and propagates originating links.
 - Produces an Excel workbook for audit/review.
@@ -16,7 +16,7 @@ Quick start (macOS)
      pip install -r requirements.txt
 3) Set your OpenAI key:
      export OPENAI_API_KEY="YOUR_KEY"
-4) Run on a folder of .docx files:
+4) Run on a folder of .docx or .pdf files:
      python alr_quote_verifier.py --input "/path/to/folder" --output-name "CHECKED_EDITS"
 
 Notes
@@ -46,6 +46,7 @@ import a2aj_client
 import journal_search
 from verifier_core import deterministic_splitter as _deterministic_splitter
 from verifier_core import supra_fallbacks as _supra_fallbacks
+from verifier_core.document_input import ParsedDocument
 
 from lxml import etree
 
@@ -1889,6 +1890,7 @@ SEARCH_ALT_PINPOINTS: bool = True
 TEXT_FRAGMENT_MODE: str = "off"  # "all", "pinpointless", "off"
 EXPORT_DETAIL_MODE: str = "diagnostic-hidden"  # "display", "display-json", "diagnostic-hidden", or "diagnostic"
 LLM_CACHE_ENABLED: bool = True
+PROPOSITION_MODE: str = "passage_since_prior_note"
 
 # --- Fallback CanLII URL generation from neutral citations ---
 
@@ -2073,6 +2075,35 @@ def _get_zip_xml(zf: zipfile.ZipFile, name: str):
     except KeyError:
         return None
     return etree.fromstring(data)
+
+
+def _load_parsed_document(input_path: str | Path) -> ParsedDocument:
+    """Read DOCX or experimental PDF input into the shared document model."""
+    path = Path(input_path).expanduser().resolve()
+    if path.suffix.casefold() == ".pdf":
+        from verifier_core.pdf_adapter import load_pdf_document
+
+        return load_pdf_document(path)
+    if path.suffix.casefold() != ".docx":
+        raise ValueError("Input must be a .docx or .pdf file")
+
+    with zipfile.ZipFile(path) as zf:
+        doc = _get_zip_xml(zf, "word/document.xml")
+        fns = _get_zip_xml(zf, "word/footnotes.xml")
+        fn_rels = _get_zip_xml(zf, "word/_rels/footnotes.xml.rels")
+        styles = _get_zip_xml(zf, "word/styles.xml")
+        if doc is None:
+            raise ValueError("Missing word/document.xml in DOCX")
+        paragraphs = extract_doc_stream_with_styles(doc, styles)
+        raw_author_links: Dict[int, List[Dict[str, Any]]] = {}
+        footnotes = extract_footnotes(fns, fn_rels, raw_author_links)
+    return ParsedDocument(
+        paragraphs=paragraphs,
+        footnotes=footnotes,
+        author_links=raw_author_links,
+        source_path=path,
+        source_kind="DOCX",
+    )
 
 
 def iter_paragraph_tokens(p) -> Iterable[Tuple[str, Any]]:
@@ -4319,6 +4350,18 @@ def compute_footnote_order(anchors: List[Dict[str, Any]], footnote_map: Dict[int
     return order
 
 
+def compute_parsed_footnote_order(
+    parsed: ParsedDocument,
+    anchors: List[Dict[str, Any]],
+) -> List[int]:
+    """Use a source-declared order when present, otherwise anchor order."""
+    preferred = [fid for fid in parsed.footnote_order if fid in parsed.footnotes]
+    if not preferred:
+        return compute_footnote_order(anchors, parsed.footnotes)
+    seen = set(preferred)
+    return preferred + sorted(fid for fid in parsed.footnotes if fid not in seen)
+
+
 # ---------------------------------------------------------------------------
 # Reference-link pipeline (M1b): a single accumulated-history pass feeds BOTH
 # the user-facing parts and the supra/ibid registry; reference links are then
@@ -5939,11 +5982,38 @@ def build_anchor_propositions(
     anchors: List[Dict[str, Any]],
     raw_to_clean: List[int],
 ) -> Dict[int, Dict[str, Any]]:
-    """Build sentence-bounded proposition text for each footnote anchor."""
+    """Build quote/proposition context for each footnote anchor.
+
+    ``footnote_sentence`` uses sentence boundaries.
+    ``passage_since_prior_note`` uses the body text between adjacent footnote
+    markers.
+    """
     anchors_sorted = sorted(anchors, key=lambda a: a["global_pos"])
     out: Dict[int, Dict[str, Any]] = {}
 
     intro_cut = _introduction_cutoff(clean_global)
+
+    if PROPOSITION_MODE == "passage_since_prior_note":
+        ordered: List[Tuple[int, int]] = []
+        seen: set[int] = set()
+        for a in anchors_sorted:
+            fid = int(a["footnote_id"])
+            if fid in seen:
+                continue
+            seen.add(fid)
+            curr_raw = int(a["global_pos"])
+            ordered.append((fid, raw_to_clean[curr_raw]))
+
+        for idx, (fid, anchor_c) in enumerate(ordered):
+            start_c = 0 if idx == 0 else ordered[idx - 1][1]
+            end_c = anchor_c
+            if fid == 1 and intro_cut:
+                start_c = max(start_c, intro_cut)
+            if start_c >= end_c:
+                continue
+            prop = re.sub(r"\s+", " ", clean_global[start_c:end_c]).strip()
+            out[fid] = {"proposition_text": prop}
+        return out
 
     prev_end = 0
 
@@ -6002,7 +6072,7 @@ def _compute_footnote_display_ids(
     next_num = 1
     for fid in footnote_order:
         text = footnote_map.get(fid, "")
-        m = re.match(r"^\s*(\*+)", text or "")
+        m = re.match(r"^\s*([*\u2020\u2021\u00a7#]+)", text or "")
         if m:
             display_map[fid] = m.group(1)
             internal_to_display_num[fid] = None
@@ -8266,29 +8336,26 @@ def _apply_quote_checks(
 
 
 def build_audit_data(
-    docx_path: str,
+    input_path: str,
     *,
     max_lookahead: int = MAX_LOOKAHEAD_CHARS_FOR_QUOTE_TO_FOOTNOTE,
     footnote_ids: Optional[set[int]] = None,
 ) -> Dict[str, Any]:
-    with zipfile.ZipFile(docx_path) as zf:
-        doc = _get_zip_xml(zf, "word/document.xml")
-        fns = _get_zip_xml(zf, "word/footnotes.xml")
-        fn_rels = _get_zip_xml(zf, "word/_rels/footnotes.xml.rels")
-        styles = _get_zip_xml(zf, "word/styles.xml")
-        if doc is None:
-            raise ValueError("Missing word/document.xml in DOCX")
+    parsed = _load_parsed_document(input_path)
+    paragraphs = parsed.paragraphs
+    global_text, para_starts, anchors = build_global_text(paragraphs)
+    raw_author_links = parsed.author_links
+    footnote_map = parsed.footnotes
 
-        paragraphs = extract_doc_stream_with_styles(doc, styles)
-        global_text, para_starts, anchors = build_global_text(paragraphs)
-        raw_author_links: Dict[int, List[Dict[str, Any]]] = {}
-        footnote_map = extract_footnotes(fns, fn_rels, raw_author_links)
+    _ts_print(
+        f"  Parsed {parsed.source_kind}: "
+        f"{len(footnote_map)} footnotes, {len(paragraphs)} paragraphs"
+    )
 
-    _ts_print(f"  Parsed DOCX: {len(footnote_map)} footnotes, {len(paragraphs)} paragraphs")
-
-    # Remap DOCX-internal footnote ids to display-order ids (1..N), matching anchor appearance order.
-    # Word typically starts real footnote ids at 2, which otherwise shifts ids by +1.
-    footnote_order_raw = compute_footnote_order(anchors, footnote_map)
+    # Remap source-internal footnote ids to display-order ids (1..N), matching
+    # anchor appearance order. Word typically starts real footnote ids at 2,
+    # which otherwise shifts ids by +1.
+    footnote_order_raw = compute_parsed_footnote_order(parsed, anchors)
     raw_to_display = {raw_fid: i for i, raw_fid in enumerate(footnote_order_raw, start=1)}
 
     # Remap anchors
@@ -8434,28 +8501,32 @@ def build_audit_data(
     }
 
 
-def _collect_docx_files(input_folder: str | Path, recursive: bool = False) -> List[Path]:
+def _collect_input_files(input_folder: str | Path, recursive: bool = False) -> List[Path]:
     in_dir = Path(input_folder)
-    pattern = "**/*.docx" if recursive else "*.docx"
+    candidates = in_dir.rglob("*") if recursive else in_dir.iterdir()
     return sorted(
-        p for p in in_dir.glob(pattern)
-        if p.is_file() and not p.name.startswith("~$")
+        path for path in candidates
+        if path.is_file()
+        and path.suffix.casefold() in {".docx", ".pdf"}
+        and not path.name.startswith("~$")
     )
 
 
-def _load_quote_discovery_context(docx_path: str | Path) -> Dict[str, Any]:
-    with zipfile.ZipFile(docx_path) as zf:
-        doc = _get_zip_xml(zf, "word/document.xml")
-        fns = _get_zip_xml(zf, "word/footnotes.xml")
-        styles = _get_zip_xml(zf, "word/styles.xml")
-        if doc is None:
-            raise ValueError("Missing word/document.xml in DOCX")
+def _collect_docx_files(input_folder: str | Path, recursive: bool = False) -> List[Path]:
+    """Backward-compatible DOCX-only collector for callers outside the CLI."""
+    return [
+        path for path in _collect_input_files(input_folder, recursive=recursive)
+        if path.suffix.casefold() == ".docx"
+    ]
 
-        paragraphs = extract_doc_stream_with_styles(doc, styles)
-        global_text, _para_starts, anchors = build_global_text(paragraphs)
-        footnote_map = extract_footnotes(fns)
 
-    footnote_order_raw = compute_footnote_order(anchors, footnote_map)
+def _load_quote_discovery_context(input_path: str | Path) -> Dict[str, Any]:
+    parsed = _load_parsed_document(input_path)
+    paragraphs = parsed.paragraphs
+    global_text, _para_starts, anchors = build_global_text(paragraphs)
+    footnote_map = parsed.footnotes
+
+    footnote_order_raw = compute_parsed_footnote_order(parsed, anchors)
     raw_to_display = {raw_fid: i for i, raw_fid in enumerate(footnote_order_raw, start=1)}
     anchors = [
         {**a, "footnote_id": raw_to_display.get(int(a.get("footnote_id") or 0), int(a.get("footnote_id") or 0))}
@@ -8551,7 +8622,7 @@ def build_quote_footnote_manifest(
         raise NotADirectoryError(f"Input folder not found or not a directory: {input_root}")
     rows: List[Dict[str, Any]] = []
     selection: Dict[str, set[int]] = {}
-    for docx_path in _collect_docx_files(input_root, recursive=recursive):
+    for docx_path in _collect_input_files(input_root, recursive=recursive):
         _ts_print(f"  Discovering quote footnotes: {docx_path.name}")
         doc_rows, selected_ids = _quote_manifest_rows_for_doc(
             docx_path,
@@ -9754,26 +9825,26 @@ def _apply_ref_chain_origin_sources(rows: List[Dict[str, Any]]) -> None:
 
 
 def build_verified_audit_data(
-    input_docx: str,
+    input_path: str,
     *,
     max_lookahead: int = 400,
     footnote_ids: Optional[set[int]] = None,
     exclude_web_citations: bool = False,
     source_matchable_only: bool = False,
 ) -> Dict[str, Any]:
-    if not os.path.exists(input_docx):
-        raise FileNotFoundError(f"Input DOCX not found: {input_docx}")
-    if not input_docx.lower().endswith(".docx"):
-        raise ValueError("Input must be a .docx file")
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input document not found: {input_path}")
+    if Path(input_path).suffix.casefold() not in {".docx", ".pdf"}:
+        raise ValueError("Input must be a .docx or .pdf file")
 
     _ts_print(f"  Building audit data ...")
     with _timing_span(
         "build_audit_data",
-        doc=os.path.basename(input_docx),
+        doc=os.path.basename(input_path),
         selected_footnotes=len(footnote_ids or []),
     ):
         data = build_audit_data(
-            input_docx,
+            input_path,
             max_lookahead=max_lookahead,
             footnote_ids=footnote_ids,
         )
@@ -9781,7 +9852,7 @@ def build_verified_audit_data(
     footnote_rows = data.get("footnote_rows", [])
     _timing_event(
         "build_audit_data:counts",
-        doc=os.path.basename(input_docx),
+        doc=os.path.basename(input_path),
         footnote_rows=len(footnote_rows),
         footnote_parts=len(data.get("footnote_parts", [])),
         footnotes=len(data.get("footnote_map", {})),
@@ -9802,7 +9873,7 @@ def build_verified_audit_data(
     _ts_print(f"  Resolving journal article links ...")
     with _timing_span(
         "resolve_journal_links",
-        doc=os.path.basename(input_docx),
+        doc=os.path.basename(input_path),
         rows=len(footnote_rows),
     ):
         _resolve_journal_links(footnote_rows)
@@ -9818,7 +9889,7 @@ def build_verified_audit_data(
     _ts_print(f"  Resolving ibid/supra reference chains ...")
     with _timing_span(
         "resolve_reference_chains",
-        doc=os.path.basename(input_docx),
+        doc=os.path.basename(input_path),
         rows=len(footnote_rows),
     ):
         resolve_reference_chains(
@@ -9852,7 +9923,7 @@ def build_verified_audit_data(
     _ts_print(f"  Running quote checks against source text ...")
     with _timing_span(
         "apply_quote_checks",
-        doc=os.path.basename(input_docx),
+        doc=os.path.basename(input_path),
         rows=len(footnote_rows),
         quote_footnotes=len(data.get("_quotes_by_footnote", {})),
     ):
@@ -9881,7 +9952,7 @@ def build_verified_audit_data(
     _ts_print(f"  Appending #page= pinpoints to links ...")
     with _timing_span(
         "append_page_pinpoint_links",
-        doc=os.path.basename(input_docx),
+        doc=os.path.basename(input_path),
         rows=len(footnote_rows),
     ):
         _append_page_pinpoint_links(footnote_rows)
@@ -9925,7 +9996,7 @@ def _has_quote_matchable_source(row: Dict[str, Any]) -> bool:
 
 
 def run_audit(
-    input_docx: str,
+    input_path: str,
     output_xlsx: str,
     *,
     max_lookahead: int = 400,
@@ -9952,7 +10023,7 @@ def run_audit(
 
     try:
         data = build_verified_audit_data(
-            input_docx,
+            input_path,
             max_lookahead=max_lookahead,
             footnote_ids=footnote_ids,
             exclude_web_citations=exclude_web_citations,
@@ -9994,7 +10065,7 @@ def run_audit_folder(
     source_matchable_only: bool = False,
 ) -> dict:
     """
-    Runs run_audit() for every .docx in input_folder and writes outputs
+    Runs run_audit() for every .docx or .pdf in input_folder and writes outputs
     into a sister folder named output_sister_folder_name.
 
     Output naming: "[CHECKER] <input_stem>.xlsx"
@@ -10014,8 +10085,8 @@ def run_audit_folder(
         if not combined_path.is_absolute():
             combined_path = (Path.cwd() / combined_path).resolve()
 
-    # Collect .docx files (skip temporary Word lock files: "~$*.docx")
-    docx_files = _collect_docx_files(in_dir, recursive=recursive)
+    # Collect DOCX and PDF files (skip temporary Word lock files).
+    docx_files = _collect_input_files(in_dir, recursive=recursive)
 
     summary = {
         "input_folder": str(in_dir),
@@ -10203,9 +10274,9 @@ def run_audit_folder(
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate an ALR footnote/citation audit workbook for a folder of DOCX files."
+        description="Generate an ALR footnote/citation audit workbook for a folder of DOCX or PDF files."
     )
-    p.add_argument("--input", required=True, help="Folder containing .docx files to process.")
+    p.add_argument("--input", required=True, help="Folder containing .docx or .pdf files to process.")
     p.add_argument(
         "--output-name",
         default="CHECKED_EDITS",
@@ -10214,7 +10285,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--single-workbook",
         default=None,
-        help="Write all processed batch rows into this one workbook instead of one workbook per DOCX.",
+        help="Write all processed batch rows into this one workbook instead of one workbook per input file.",
     )
     p.add_argument(
         "--max-selected-footnotes",
@@ -10318,6 +10389,16 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help='Text fragment links: "all" (every match), "pinpointless" (only when no pinpoint), "off" (default).',
     )
     p.add_argument(
+        "--proposition-mode",
+        default="passage_since_prior_note",
+        choices=("footnote_sentence", "passage_since_prior_note"),
+        help=(
+            'Quote/proposition context: "footnote_sentence" uses one sentence; '
+            '"passage_since_prior_note" uses all text since the previous '
+            'footnote marker. Default: passage_since_prior_note.'
+        ),
+    )
+    p.add_argument(
         "--export-detail",
         default="diagnostic-hidden",
         choices=("display", "display-json", "diagnostic-hidden", "diagnostic"),
@@ -10352,6 +10433,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _configure_proposition_mode(args: argparse.Namespace) -> None:
+    global PROPOSITION_MODE
+    PROPOSITION_MODE = (
+        getattr(args, "proposition_mode", "passage_since_prior_note")
+        or "passage_since_prior_note"
+    )
+    if PROPOSITION_MODE not in {
+        "footnote_sentence",
+        "passage_since_prior_note",
+    }:
+        PROPOSITION_MODE = "passage_since_prior_note"
+
+
 def _configure_from_args(args: argparse.Namespace) -> None:
     global LINK_RESOLVER, SUPRA_MODE, USE_DB_SEARCH, USE_A2AJ, SEARCH_ALT_PINPOINTS, TEXT_FRAGMENT_MODE, EXPORT_DETAIL_MODE, LLM_CACHE_ENABLED
     global RUN_MODE, PURE_REF_PREFILTER, DETERMINISTIC_SOURCE_SPLITTER, FREE_NO_LLM, LOCAL_ONLY
@@ -10367,6 +10461,7 @@ def _configure_from_args(args: argparse.Namespace) -> None:
     USE_A2AJ = bool(getattr(args, "use_a2aj", True))
     SEARCH_ALT_PINPOINTS = not bool(getattr(args, "no_alt_pinpoints", False))
     TEXT_FRAGMENT_MODE = getattr(args, "text_fragment_mode", "off") or "off"
+    _configure_proposition_mode(args)
     EXPORT_DETAIL_MODE = getattr(args, "export_detail", "diagnostic-hidden") or "diagnostic-hidden"
     LLM_CACHE_ENABLED = not bool(getattr(args, "no_llm_cache", False))
     LOCAL_ONLY = bool(getattr(args, "local_only", False))
@@ -10412,6 +10507,7 @@ def _configure_from_args(args: argparse.Namespace) -> None:
 
 def _main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
+    _configure_proposition_mode(args)
 
     if args.timing_log:
         _set_timing_log_path(args.timing_log)
