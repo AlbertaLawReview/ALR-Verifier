@@ -1743,8 +1743,8 @@ class ALRQuoteVerifierGUI:
         corpus_card = self._grid_group(right, "A2AJ local corpus")
         ttk.Label(
             corpus_card,
-            text="Downloads all cases and legislation from A2AJ. You can "
-                 "update it later without downloading everything again.",
+            text="Downloads all cases and legislation from A2AJ. Updates "
+                 "reuse unchanged files and resume interrupted downloads.",
             style="CardMuted.TLabel", wraplength=380, justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 7))
         self.a2aj_corpus_status_var = tk.StringVar(value="Checking local status…")
@@ -1865,7 +1865,8 @@ class ALRQuoteVerifierGUI:
         _info_dot(
             advanced_flags,
             "Allows PDF files to be added and verified directly. "
-            "Leave this off for the standard DOCX workflow.",
+            "PDF mode supports bottom-of-page footnotes with same-page "
+            "references, not endnotes. Leave this off for the standard DOCX workflow.",
         ).pack(side=tk.LEFT, padx=(6, 0))
         detail_row = ttk.Frame(adv_card, style="Card.TFrame")
         detail_row.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))

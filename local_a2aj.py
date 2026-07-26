@@ -154,8 +154,12 @@ class LocalA2AJCorpus:
                 last_modified=remote.last_modified if remote else "", stale=True if remote else None,
             )
         files = tuple(CorpusFile(**item) for item in manifest.get("files") or ())
+        local_files = tuple(
+            CorpusFile(**item)
+            for item in (manifest.get("local_files") or manifest.get("files") or ())
+        )
         revision = str(manifest.get("revision") or "")
-        installed = self._files_present(self.root / kind, files)
+        installed = self._files_present(self.root / kind, local_files)
         local_inventory = {(item.path, item.sha256, item.size) for item in files}
         remote_inventory = (
             {(item.path, item.sha256, item.size) for item in remote.files} if remote else None
@@ -163,7 +167,7 @@ class LocalA2AJCorpus:
         return CorpusStatus(
             kind, installed, revision, remote.revision if remote else "",
             remote.last_modified if remote else str(manifest.get("last_modified") or ""),
-            len(files), sum(item.size for item in files),
+            len(local_files), sum(item.size for item in local_files),
             (not installed or local_inventory != remote_inventory) if remote else None,
         )
 
@@ -187,12 +191,27 @@ class LocalA2AJCorpus:
         active = self.root / kind
         old = self._read_manifest(kind)
         old_files = {item["path"]: item for item in (old or {}).get("files") or ()}
+        old_local_files = {
+            item["path"]: item
+            for item in (
+                (old or {}).get("local_files")
+                or (old or {}).get("files")
+                or ()
+            )
+        }
         old_inventory = {
             (item.get("path"), item.get("sha256"), item.get("size"))
             for item in (old or {}).get("files") or ()
         }
         remote_inventory = {(item.path, item.sha256, item.size) for item in remote.files}
-        if old and old_inventory == remote_inventory and self._files_present(active, remote.files):
+        installed_old_files = tuple(
+            CorpusFile(**item) for item in old_local_files.values()
+        )
+        if (
+            old
+            and old_inventory == remote_inventory
+            and self._files_present(active, installed_old_files)
+        ):
             _progress(progress, kind, "index", remote.size, remote.size, "Preparing fast local lookup")
             self._ensure_lookup_index(kind)
             return self.status(kind, remote)
@@ -204,41 +223,59 @@ class LocalA2AJCorpus:
         total = remote.size
         completed = 0
         staging.mkdir(exist_ok=True)
+        local_files = []
         try:
             for item in remote.files:
                 self._check_cancel(cancelled)
                 relative = _safe_relative(item.path)
                 destination = staging / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if self._file_matches(destination, item):
-                    completed += item.size
-                    _progress(progress, kind, "reuse", completed, total, item.path)
-                    continue
                 source = active / relative
                 prior = old_files.get(item.path)
-                if (prior and prior.get("sha256") == item.sha256
-                        and source.is_file() and source.stat().st_size == item.size):
-                    try:
-                        os.link(source, destination)
-                    except OSError:
-                        shutil.copy2(source, destination)
+                prior_local = old_local_files.get(item.path)
+                if (
+                    prior
+                    and prior_local
+                    and prior.get("sha256") == item.sha256
+                    and source.is_file()
+                    and source.stat().st_size == prior_local.get("size")
+                ):
+                    self._link_or_copy(source, destination)
+                    local_files.append(prior_local)
                     completed += item.size
                     _progress(progress, kind, "reuse", completed, total, item.path)
                     continue
-                self._download_file(remote, item, destination, completed, total, progress, cancelled)
+                if not self._file_matches(destination, item):
+                    self._download_file(
+                        remote, item, destination, completed, total, progress, cancelled
+                    )
+                if (
+                    prior_local
+                    and source.is_file()
+                    and source.stat().st_size == prior_local.get("size")
+                    and self._parquet_equivalent(source, destination)
+                ):
+                    destination.unlink()
+                    self._link_or_copy(source, destination)
+                    local_files.append(prior_local)
+                    phase = "reuse"
+                else:
+                    local_files.append(asdict(item))
+                    phase = "download"
                 completed += item.size
-                _progress(progress, kind, "download", completed, total, item.path)
+                _progress(progress, kind, phase, completed, total, item.path)
 
             self._check_cancel(cancelled)
             _progress(progress, kind, "index", total, total, "Preparing fast local lookup")
             self._build_lookup_index(staging, remote.files, remote.revision)
             manifest = {
-                "version": 1,
+                "version": 2,
                 "kind": kind,
                 "repository": remote.repository,
                 "revision": remote.revision,
                 "last_modified": remote.last_modified,
                 "files": [asdict(item) for item in remote.files],
+                "local_files": local_files,
             }
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
@@ -693,19 +730,25 @@ class LocalA2AJCorpus:
 
     @staticmethod
     def _paths_for_query(kind: str, paths: list[Path], value: str) -> list[Path]:
-        by_dataset = {path.parent.name.upper(): path for path in paths}
+        def dataset_paths(dataset: str) -> list[Path]:
+            wanted = dataset.upper()
+            return [
+                path for path in paths
+                if any(parent.name.upper() == wanted for parent in path.parents)
+            ]
+
         value = str(value or "")
         if kind == "cases":
             for match in _NEUTRAL_CITATION_RE.finditer(value):
-                path = by_dataset.get(match.group(1).upper())
-                if path is not None:
-                    return [path]
+                matching = dataset_paths(match.group(1))
+                if matching:
+                    return matching
         elif kind == "laws":
             for pattern, dataset in _LAW_DATASET_PATTERNS:
                 if re.search(pattern, value, re.I):
-                    path = by_dataset.get(dataset)
-                    if path is not None:
-                        return [path]
+                    matching = dataset_paths(dataset)
+                    if matching:
+                        return matching
         return paths
 
     def _parquet_paths(self, kind: str) -> list[Path]:
@@ -772,6 +815,42 @@ class LocalA2AJCorpus:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest() == item.sha256
+
+    @staticmethod
+    def _link_or_copy(source: Path, destination: Path) -> None:
+        destination.unlink(missing_ok=True)
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+
+    @staticmethod
+    def _parquet_equivalent(first: Path, second: Path) -> bool:
+        """Return whether two Parquet files contain the same rows in any order."""
+        try:
+            import duckdb
+        except ImportError as exc:  # pragma: no cover - packaging guarantees it.
+            raise RuntimeError("Local A2AJ updates require the duckdb package") from exc
+        difference = (
+            "SELECT count(*) FROM ("
+            "SELECT * FROM read_parquet(?) "
+            "EXCEPT ALL "
+            "SELECT * FROM read_parquet(?)"
+            ")"
+        )
+        try:
+            with duckdb.connect() as connection:
+                connection.execute("PRAGMA disable_progress_bar")
+                return (
+                    connection.execute(
+                        difference, [str(first), str(second)]
+                    ).fetchone()[0] == 0
+                    and connection.execute(
+                        difference, [str(second), str(first)]
+                    ).fetchone()[0] == 0
+                )
+        except Exception:
+            return False
 
     @staticmethod
     def _check_cancel(cancelled: Optional[CancelCallback]) -> None:

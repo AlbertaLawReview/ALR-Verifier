@@ -85,6 +85,77 @@ def test_incremental_atomic_update_and_exact_lookup(tmp_path):
     assert corpus.status("cases").installed is False
 
 
+def test_row_reordering_does_not_replace_an_existing_partition(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    original = source / "original.parquet"
+    reordered = source / "reordered.parquet"
+    rows = (
+        ("2024 SCC 1", "First Case", "first text"),
+        ("2024 SCC 2", "Second Case", "second text"),
+    )
+    with duckdb.connect() as connection:
+        connection.execute(
+            "CREATE TABLE rows(dataset VARCHAR, citation_en VARCHAR, "
+            "name_en VARCHAR, unofficial_text_en VARCHAR)"
+        )
+        connection.executemany(
+            "INSERT INTO rows VALUES ('SCC', ?, ?, ?)", rows
+        )
+        connection.table("rows").write_parquet(str(original))
+        connection.execute("DELETE FROM rows")
+        connection.executemany(
+            "INSERT INTO rows VALUES ('SCC', ?, ?, ?)", reversed(rows)
+        )
+        connection.table("rows").write_parquet(str(reordered))
+
+    def corpus_file(path):
+        content = path.read_bytes()
+        return CorpusFile(
+            "SCC/train.parquet", hashlib.sha256(content).hexdigest(), len(content)
+        )
+
+    original_file = corpus_file(original)
+    reordered_file = corpus_file(reordered)
+    assert original_file.sha256 != reordered_file.sha256
+    corpus = CopyingCorpus(
+        tmp_path / "corpus",
+        {
+            original_file.sha256: original,
+            reordered_file.sha256: reordered,
+        },
+    )
+    initial = RemoteSnapshot(
+        "cases", "a2aj/test", "rev-1", "2026-01-01", (original_file,)
+    )
+    update = RemoteSnapshot(
+        "cases", "a2aj/test", "rev-2", "2026-01-08", (reordered_file,)
+    )
+
+    corpus.install_or_update("cases", remote=initial)
+    installed = corpus.root / "cases" / original_file.path
+    original_bytes = installed.read_bytes()
+    manifest_path = corpus.root / "cases" / "manifest.json"
+    legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    legacy_manifest["version"] = 1
+    legacy_manifest.pop("local_files")
+    manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+    corpus.downloaded.clear()
+    status = corpus.install_or_update("cases", remote=update)
+
+    assert corpus.downloaded == [original_file.path]
+    assert installed.read_bytes() == original_bytes
+    assert status.installed is True
+    assert status.stale is False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["files"][0]["sha256"] == reordered_file.sha256
+    assert manifest["local_files"][0]["sha256"] == original_file.sha256
+
+    corpus.downloaded.clear()
+    corpus.install_or_update("cases", remote=update)
+    assert corpus.downloaded == []
+
+
 def test_exact_lookup_survives_unwritable_query_cache(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -216,24 +287,29 @@ def test_hugging_face_metadata_shape(tmp_path):
 
 
 def test_neutral_citation_reads_only_its_dataset_partition(tmp_path):
-    paths = [tmp_path / "BCCA" / "train.parquet", tmp_path / "FC" / "train.parquet"]
+    paths = [
+        tmp_path / "BCCA" / "train.parquet",
+        tmp_path / "FC" / "2025.parquet",
+        tmp_path / "FC" / "2026.parquet",
+    ]
     assert LocalA2AJCorpus._paths_for_query(
         "cases", paths, "Example v Canada, 2022 FC 960"
-    ) == [paths[1]]
+    ) == paths[1:]
     assert LocalA2AJCorpus._paths_for_query(
         "cases", paths, "Example v Canada, [2022] 1 SCR 1"
     ) == paths
     law_paths = [
         tmp_path / "LEGISLATION-FED" / "train.parquet",
-        tmp_path / "LEGISLATION-ON" / "train.parquet",
+        tmp_path / "LEGISLATION-ON" / "pre-2000.parquet",
+        tmp_path / "LEGISLATION-ON" / "2000-present.parquet",
         tmp_path / "REGULATIONS-ON" / "train.parquet",
     ]
     assert LocalA2AJCorpus._paths_for_query(
         "laws", law_paths, "Employment Standards Act, 2000, SO 2000, c 41"
-    ) == [law_paths[1]]
+    ) == law_paths[1:3]
     assert LocalA2AJCorpus._paths_for_query(
         "laws", law_paths, "O Reg 285/01"
-    ) == [law_paths[2]]
+    ) == [law_paths[3]]
     assert LocalA2AJCorpus._paths_for_query(
         "laws", law_paths, "RSC 1985, c X-1"
     ) == [law_paths[0]]

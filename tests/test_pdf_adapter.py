@@ -94,11 +94,14 @@ def test_pdf_line_wrapped_quote_uses_passage_context(monkeypatch):
 
 
 def test_local_extractor_honors_pymupdf_superscript_flag():
+    observed = {}
+
     class Page:
         rect = SimpleNamespace(width=612, height=792)
 
         @staticmethod
-        def get_text(_kind, **_kwargs):
+        def get_text(_kind, **kwargs):
+            observed.update(kwargs)
             return {
                 "blocks": [{
                     "type": 0,
@@ -131,6 +134,152 @@ def test_local_extractor_honors_pymupdf_superscript_flag():
 
     assert "superscript" in row["native_pdf_span_styles"][1]["styles"]
     assert pdf_adapter._native_superscript_spans(row, body_size=10) == [[5, 6]]
+    assert observed["flags"] & fitz.TEXT_COLLECT_STYLES
+    assert not observed["flags"] & fitz.TEXT_PRESERVE_IMAGES
+
+
+def test_local_extractor_normalizes_skia_zero_width_boundaries():
+    class Page:
+        rect = SimpleNamespace(width=612, height=792)
+
+        @staticmethod
+        def get_text(_kind, **_kwargs):
+            return {
+                "blocks": [{
+                    "type": 0,
+                    "bbox": (72, 90, 180, 105),
+                    "lines": [{
+                        "bbox": (72, 90, 180, 105),
+                        "spans": [
+                            {
+                                "text": "\u200bWords\u200b\u200bwith\u200b",
+                                "font": "Arial",
+                                "size": 10,
+                                "flags": 0,
+                                "bbox": (72, 90, 125, 105),
+                            },
+                            {
+                                "text": "\u200bstyles\u200b",
+                                "font": "Arial-Italic",
+                                "size": 10,
+                                "flags": 0,
+                                "bbox": (125, 90, 165, 105),
+                            },
+                            {
+                                "text": "1",
+                                "font": "Arial",
+                                "size": 6,
+                                "flags": fitz.TEXT_FONT_SUPERSCRIPT,
+                                "bbox": (165, 88, 170, 99),
+                            },
+                        ],
+                    }],
+                }],
+            }
+
+    row = pdf_adapter._local_page_rows(
+        Page(), pdf_page=1, article={"article_id": "probe", "dataset": "test"}
+    )[0]
+
+    assert row["raw_transcription"] == "Words with styles1"
+    assert [
+        span["selected_text"] for span in row["native_pdf_span_styles"]
+    ] == ["Words with", "styles", "1"]
+    assert pdf_adapter._native_superscript_spans(row, body_size=10) == [[17, 18]]
+
+
+def test_detached_superscript_pairs_only_with_same_page_footnote():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 1,
+            "line_id": "body",
+            "region_type": "text",
+            "raw_transcription": "Held.",
+            "native_pdf_median_font_size": 10,
+            "native_pdf_span_styles": [{
+                "start": 0,
+                "end": 5,
+                "size": 10,
+                "styles": [],
+                "x0": 100,
+                "x1": 180,
+            }],
+            "line_bbox_px": {"x0": 100, "y0": 200, "x1": 180, "y1": 224},
+            "page_width_px": 1224,
+            "page_height_px": 1584,
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 1,
+            "line_id": "detached-ref",
+            "region_type": "text",
+            "raw_transcription": "1",
+            "native_pdf_median_font_size": 6,
+            "native_pdf_span_styles": [{
+                "start": 0,
+                "end": 1,
+                "size": 6,
+                "styles": [],
+                "x0": 182,
+                "x1": 187,
+            }],
+            "line_bbox_px": {"x0": 182, "y0": 198, "x1": 187, "y1": 211},
+            "page_width_px": 1224,
+            "page_height_px": 1584,
+        },
+        {
+            "input_order": 3,
+            "reading_order_index": 3,
+            "pdf_page": 1,
+            "line_id": "note",
+            "region_type": "text",
+            "raw_transcription": "1 Note text.",
+            "native_pdf_median_font_size": 8,
+            "native_pdf_span_styles": [
+                {
+                    "start": 0,
+                    "end": 1,
+                    "size": 5,
+                    "styles": [],
+                    "x0": 100,
+                    "x1": 105,
+                },
+                {
+                    "start": 2,
+                    "end": 12,
+                    "size": 8,
+                    "styles": [],
+                    "x0": 110,
+                    "x1": 200,
+                },
+            ],
+            "line_bbox_px": {"x0": 100, "y0": 1320, "x1": 200, "y1": 1340},
+            "page_width_px": 1224,
+            "page_height_px": 1584,
+        },
+    ]
+
+    pdf_adapter._associate_detached_references(rows, {1: 650})
+    pdf_adapter._classify_regions(rows, {1: 650})
+    markers, summary = pdf_adapter._simple_pair(rows)
+    footnotes, lookup = pdf_adapter._materialize_footnotes(rows, markers)
+    paragraphs = pdf_adapter._body_paragraphs(rows, markers, lookup)
+
+    label = next(marker for marker in markers if marker["role"] == "fn_label")
+    ref = next(marker for marker in markers if marker["role"] == "fn_ref")
+    assert label["pdf_page"] == ref["pdf_page"] == 1
+    assert summary["scope"] == "same_page_footnotes"
+    assert footnotes == [(1, "Note text.")]
+    assert paragraphs == [{
+        "style_id": None,
+        "style_name": None,
+        "effective_indent_left": None,
+        "text": "Held.⟦FN:1⟧",
+        "anchors": [{"footnote_id": 1, "offset": 5}],
+    }]
 
 
 def test_deterministic_pairer_accepts_glued_labels_and_rejects_false_labels():
@@ -245,7 +394,94 @@ def test_deterministic_pairer_keeps_restarted_note_pairs_distinct():
     assert labels[0]["materialized_pair_id"] != labels[1]["materialized_pair_id"]
 
 
-def test_deterministic_pairer_prefers_small_printed_label_over_date_tail():
+def test_deterministic_pairer_never_pairs_across_pages():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 1,
+            "line_id": "body",
+            "region_type": "body",
+            "raw_transcription": "First1",
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 2,
+            "line_id": "note",
+            "region_type": "footnote",
+            "raw_transcription": "1 Wrong-page note.",
+            "native_pdf_median_font_size": 8,
+            "native_pdf_span_styles": [{
+                "start": 0,
+                "end": 1,
+                "size": 4.6,
+                "styles": [],
+            }],
+        },
+    ]
+
+    markers, summary = pdf_adapter._simple_pair(rows)
+
+    assert markers == []
+    assert summary["pair_count"] == 0
+    assert summary["label_only_count"] == 0
+
+
+def test_deterministic_pairer_discards_unreferenced_labels_on_a_paired_page():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 1,
+            "line_id": "body",
+            "region_type": "body",
+            "raw_transcription": "First1",
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 1,
+            "line_id": "note-1",
+            "region_type": "footnote",
+            "raw_transcription": "1 First note.",
+            "native_pdf_median_font_size": 8,
+            "native_pdf_span_styles": [{
+                "start": 0,
+                "end": 1,
+                "size": 4.6,
+                "styles": [],
+            }],
+        },
+        {
+            "input_order": 3,
+            "reading_order_index": 3,
+            "pdf_page": 1,
+            "line_id": "note-2",
+            "region_type": "footnote",
+            "raw_transcription": "2 Unreferenced note.",
+            "native_pdf_median_font_size": 8,
+            "native_pdf_span_styles": [{
+                "start": 0,
+                "end": 1,
+                "size": 4.6,
+                "styles": [],
+            }],
+        },
+    ]
+
+    markers, summary = pdf_adapter._simple_pair(rows)
+
+    assert [
+        marker["note_id"]
+        for marker in markers
+        if marker["role"] == "fn_label"
+    ] == ["1"]
+    assert summary["pair_count"] == 1
+    assert summary["label_only_count"] == 0
+
+
+def test_deterministic_pairer_rejects_wrong_page_label_and_date_tail():
     rows = [
         {
             "input_order": 1,
@@ -297,10 +533,10 @@ def test_deterministic_pairer_prefers_small_printed_label_over_date_tail():
         },
     ]
 
-    markers, _summary = pdf_adapter._simple_pair(rows)
-    label = next(marker for marker in markers if marker["role"] == "fn_label")
+    markers, summary = pdf_adapter._simple_pair(rows)
 
-    assert label["line_id"] == "printed-label"
+    assert markers == []
+    assert summary["pair_count"] == 0
 
 
 def test_separator_prefers_short_footnote_rule_over_table_rule():
@@ -325,6 +561,48 @@ def test_separator_prefers_short_footnote_rule_over_table_rule():
             }]
 
     assert pdf_adapter._separator_y(Page()) == 500
+
+
+def test_typographic_labels_override_a_rule_drawn_inside_the_note_block():
+    def row(order, text, y, size, *, label_size=None):
+        spans = [{
+            "start": 0,
+            "end": len(text),
+            "size": size,
+            "styles": [],
+        }]
+        if label_size is not None:
+            spans[0].update(end=len(text.split()[0]), size=label_size)
+        return {
+            "input_order": order,
+            "reading_order_index": order,
+            "pdf_page": 1,
+            "line_id": f"line-{order}",
+            "region_type": "text",
+            "raw_transcription": text,
+            "native_pdf_median_font_size": size,
+            "native_pdf_span_styles": spans,
+            "line_bbox_px": {"x0": 100, "y0": y, "x1": 900, "y1": y + 16},
+            "page_width_px": 1224,
+            "page_height_px": 1584,
+        }
+
+    rows = [
+        row(1, "Body prose.1", 500, 10),
+        row(2, "1 First note.", 900, 8, label_size=4.6),
+        row(3, "Note continuation.", 930, 8),
+        row(4, "2 Second note.", 1000, 8, label_size=4.6),
+    ]
+
+    # The source PDF's nominal footnote rule is misplaced below both labels.
+    pdf_adapter._classify_regions(rows, {1: 550})
+
+    assert [item["region_type"] for item in rows] == [
+        "body",
+        "footnote",
+        "footnote",
+        "footnote",
+    ]
 
 
 def test_paired_labels_refine_continuation_zone_without_swallowing_heading():
@@ -487,6 +765,40 @@ def test_restarted_note_numbers_use_pair_ids():
 
     assert footnotes == [(1, "First note."), (2, "Second note.")]
     assert [p["anchors"][0]["footnote_id"] for p in paragraphs] == [1, 2]
+
+
+def test_pdf_footnote_materialization_never_crosses_a_page_boundary():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 1,
+            "line_id": "note",
+            "region_type": "footnote",
+            "raw_transcription": "1 Same-page text.",
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 2,
+            "line_id": "other-page",
+            "region_type": "footnote",
+            "raw_transcription": "Unrelated text from another page.",
+        },
+    ]
+    markers = [{
+        "role": "fn_label",
+        "note_id": "1",
+        "materialized_pair_id": "pair-1",
+        "reading_order_index": 1,
+        "pdf_page": 1,
+        "line_id": "note",
+        "end_offset": 1,
+    }]
+
+    footnotes, _lookup = pdf_adapter._materialize_footnotes(rows, markers)
+
+    assert footnotes == [(1, "Same-page text.")]
 
 
 @pytest.mark.parametrize("symbol", ["*", "†", "‡", "§", "#"])

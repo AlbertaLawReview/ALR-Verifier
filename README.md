@@ -37,7 +37,9 @@ CHECKED_EDITS by default.
 PDF intake is experimental on this branch. It uses a self-contained,
 deterministic PyMuPDF module for native text and footnote pairing. Enable it
 under **Settings → Advanced → Enable experimental PDF input**. PDFs with
-unusual layouts should be reviewed carefully.
+unusual layouts should be reviewed carefully. This mode supports
+bottom-of-page footnotes whose references are on the same page; it does not
+support endnotes.
 
 An OpenAI API key is required for modes that use AI. Enter it when prompted or
 set OPENAI_API_KEY. A key entered in the Windows application is encrypted for
@@ -73,12 +75,16 @@ retention policies yourself.
 
 The **A2AJ local corpus** panel can install the complete case-law and
 legislation datasets for faster local-first lookups. It checks upstream
-partition metadata for staleness, resumes interrupted downloads, and downloads
-only changed or new partitions during an update. The separate **Local only**
-setting requires that complete corpus and prevents verification runs from
-making network requests; journal retrieval and the bundled reference database
-are already local. Installing or updating the corpus is an explicit network
-operation and currently requires about 4.9 GB of storage.
+partition metadata for staleness, resumes interrupted downloads, and reuses
+byte-identical partitions. If an upstream Parquet file was merely serialized in
+a different row order, the update retains the existing local file after
+verifying that its rows are unchanged. Stable multi-file dataset partitions are
+also supported so upstream publishers can add shards without replacing prior
+ones. The separate **Local only** setting requires that complete corpus and
+prevents verification runs from making network requests; journal retrieval and
+the bundled reference database are already local. Installing or updating the
+corpus is an explicit network operation and currently requires about 4.9 GB of
+storage.
 
 ## Windows package
 

@@ -1,8 +1,9 @@
 """Experimental direct-PDF intake for ALR Quote Verifier.
 
 PyMuPDF extracts native PDF lines, a deterministic pairing pass identifies
-note labels and body refs, and the intake layer returns the source-neutral
-``ParsedDocument`` model consumed by the verifier pipeline.
+bottom-of-page note labels and same-page body refs, and the intake layer
+returns the source-neutral ``ParsedDocument`` model consumed by the verifier
+pipeline. Endnotes and cross-page note references are intentionally unsupported.
 
 This lane is experimental: PDFs with unusual layouts should be reviewed
 carefully until it has its own corpus gate.
@@ -11,6 +12,7 @@ carefully until it has its own corpus gate.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -21,6 +23,7 @@ from verifier_core.document_input import ParsedDocument
 
 PDF_DPI = 144
 _SPAN_SPACE_GAP_FRAC = 0.15
+_DOUBLE_ZERO_WIDTH_RE = re.compile(r"\u200b{2,}")
 
 _NOTE_LABEL_RE = re.compile(
     r"^\s*(?:"
@@ -37,6 +40,7 @@ _SYMBOL_REF_RE = re.compile(
     r"(?<=[A-Za-z0-9\])\"'”’])(?P<value>[*\u2020\u2021\u00a7#])"
     r"(?=[\s.,;:!?)]|$)"
 )
+_STANDALONE_REF_RE = re.compile(r"(?P<value>\d{1,3}|[*\u2020\u2021\u00a7#])")
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,14 @@ def _bbox(values: Sequence[Any], *, scale: float) -> dict[str, float]:
     return {key: round(float(raw[index]) * scale, 2) for index, key in enumerate(("x0", "y0", "x1", "y1"))}
 
 
+def _normalize_pdf_text(value: Any) -> str:
+    """Remove Skia layout markers without joining the words they separate."""
+
+    text = str(value or "").replace("\ufeff", "")
+    text = _DOUBLE_ZERO_WIDTH_RE.sub(" ", text)
+    return text.replace("\u200b", "")
+
+
 def _local_page_rows(page: Any, *, pdf_page: int, article: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Extract deterministic native-text lines without an external checkout."""
 
@@ -64,6 +76,9 @@ def _local_page_rows(page: Any, *, pdf_page: int, article: Mapping[str, Any]) ->
 
     scale = PDF_DPI / 72.0
     flags = getattr(fitz, "TEXTFLAGS_DICT", 0)
+    # TEXTFLAGS_DICT otherwise decodes image payloads that this text-only
+    # parser immediately discards.
+    flags &= ~getattr(fitz, "TEXT_PRESERVE_IMAGES", 0)
     flags |= getattr(fitz, "TEXT_COLLECT_STYLES", 0)
     try:
         text_page = page.get_text("dict", flags=flags, sort=True)
@@ -82,20 +97,34 @@ def _local_page_rows(page: Any, *, pdf_page: int, article: Mapping[str, Any]) ->
             span_ranges: list[dict[str, Any]] = []
             offset = 0
             previous_x1: float | None = None
+            previous_trailing_boundary = False
             for span in spans:
-                part = str(span.get("text") or "")
+                raw_part = str(span.get("text") or "")
+                leading_boundary = raw_part.startswith("\u200b")
+                trailing_boundary = raw_part.endswith("\u200b")
+                part = _normalize_pdf_text(raw_part)
+                if not part:
+                    previous_trailing_boundary = (
+                        previous_trailing_boundary or trailing_boundary
+                    )
+                    continue
                 span_box = list(span.get("bbox") or (0, 0, 0, 0))
                 if (
                     previous_x1 is not None
                     and raw_parts
                     and not raw_parts[-1].endswith(" ")
                     and not part.startswith(" ")
-                    and float(span_box[0]) - previous_x1
-                    >= _SPAN_SPACE_GAP_FRAC * (float(span.get("size") or 0) or 10.0)
+                    and (
+                        previous_trailing_boundary and leading_boundary
+                        or float(span_box[0]) - previous_x1
+                        >= _SPAN_SPACE_GAP_FRAC
+                        * (float(span.get("size") or 0) or 10.0)
+                    )
                 ):
                     raw_parts.append(" ")
                     offset += 1
                 previous_x1 = float(span_box[2])
+                previous_trailing_boundary = trailing_boundary
                 start, end = offset, offset + len(part)
                 flags_value = int(span.get("flags") or 0)
                 styles = []
@@ -111,6 +140,8 @@ def _local_page_rows(page: Any, *, pdf_page: int, article: Mapping[str, Any]) ->
                     "size": float(span.get("size") or 0),
                     "flags": flags_value,
                     "styles": styles,
+                    "x0": round(float(span_box[0]) * scale, 2),
+                    "x1": round(float(span_box[2]) * scale, 2),
                     "y0": round(float(span_box[1]) * scale, 2),
                     "y1": round(float(span_box[3]) * scale, 2),
                 })
@@ -214,6 +245,134 @@ def _row_height(row: Mapping[str, Any]) -> float:
     return max(1.0, float(box.get("y1") or 0) - float(box.get("y0") or 0))
 
 
+def _label_is_typographic(
+    row: Mapping[str, Any], *, start: int, end: int, body_size: float
+) -> tuple[bool, float]:
+    spans = [
+        span
+        for span in row.get("native_pdf_span_styles") or ()
+        if int(span.get("start") or 0) < end
+        and int(span.get("end") or 0) > start
+    ]
+    line_size = float(row.get("native_pdf_median_font_size") or 0)
+    label_size = min(
+        (float(span.get("size") or 0) for span in spans),
+        default=line_size,
+    )
+    typographic = any(
+        "superscript" in set(span.get("styles") or ())
+        or (
+            line_size > 0
+            and 0 < float(span.get("size") or 0) <= line_size * 0.75
+        )
+        for span in spans
+    ) or 0 < label_size <= body_size * 0.75
+    return typographic, label_size
+
+
+def _detached_reference_target(
+    reference_row: Mapping[str, Any],
+    page_rows: Sequence[Mapping[str, Any]],
+    *,
+    body_size: float,
+) -> tuple[Mapping[str, Any], int] | None:
+    ref_box = reference_row.get("line_bbox_px") or {}
+    ref_x = (
+        float(ref_box.get("x0") or 0) + float(ref_box.get("x1") or 0)
+    ) / 2
+    ref_y = _row_y(reference_row)
+    options: list[tuple[tuple[float, float, int], Mapping[str, Any], int]] = []
+    for row in page_rows:
+        if row is reference_row:
+            continue
+        size = float(row.get("native_pdf_median_font_size") or 0)
+        if size < body_size * 0.80:
+            continue
+        if abs(_row_y(row) - ref_y) > max(4.0, _row_height(row) * 0.20):
+            continue
+        boundaries: list[tuple[float, int]] = []
+        for span in row.get("native_pdf_span_styles") or ():
+            boundaries.extend((
+                (abs(ref_x - float(span.get("x0") or 0)), int(span.get("start") or 0)),
+                (abs(ref_x - float(span.get("x1") or 0)), int(span.get("end") or 0)),
+            ))
+        if not boundaries:
+            continue
+        distance, offset = min(boundaries, key=lambda item: (item[0], -item[1]))
+        if distance > max(12.0, body_size * 2.0):
+            continue
+        options.append((
+            (
+                distance,
+                abs(_row_y(row) - ref_y),
+                abs(
+                    int(row.get("input_order") or 0)
+                    - int(reference_row.get("input_order") or 0)
+                ),
+            ),
+            row,
+            offset,
+        ))
+    if not options:
+        return None
+    _score, target, offset = min(options, key=lambda item: item[0])
+    return target, offset
+
+
+def _associate_detached_references(
+    rows: Sequence[dict[str, Any]],
+    separator_by_page: Mapping[int, float | None],
+) -> None:
+    """Attach standalone superscript glyph rows to nearby body text."""
+
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_page.setdefault(int(row.get("pdf_page") or 0), []).append(row)
+
+    for page_no, page_rows in by_page.items():
+        page_height = max(float(row.get("page_height_px") or 0) for row in page_rows)
+        body_sizes = [
+            float(row.get("native_pdf_median_font_size") or 0)
+            for row in page_rows
+            if _row_y(row) < page_height * 0.75
+            and 7.0 <= float(row.get("native_pdf_median_font_size") or 0) <= 20.0
+        ]
+        body_size = median(body_sizes) if body_sizes else 10.0
+        separator = separator_by_page.get(page_no)
+        separator_px = (
+            float(separator) * (PDF_DPI / 72.0)
+            if separator is not None
+            else page_height * 0.88
+        )
+        for row in page_rows:
+            match = _STANDALONE_REF_RE.fullmatch(
+                str(row.get("raw_transcription") or "").strip()
+            )
+            size = float(row.get("native_pdf_median_font_size") or 0)
+            if (
+                match is None
+                or not (0 < size <= body_size * 0.75)
+                or _row_y(row) >= separator_px
+            ):
+                continue
+            target = _detached_reference_target(
+                row, page_rows, body_size=body_size
+            )
+            if target is None:
+                continue
+            target_row, offset = target
+            value = match.group("value")
+            target_row.setdefault("detached_pdf_references", []).append({
+                "note_id": str(int(value)) if value.isdigit() else value,
+                "selected_text": value,
+                "start_offset": offset,
+                "end_offset": offset,
+                "source_line_id": row.get("line_id", ""),
+            })
+            row["detached_pdf_reference"] = True
+            row["exclude_from_body"] = True
+
+
 def _looks_like_label(text: str) -> bool:
     return bool(_NOTE_LABEL_RE.match(text or ""))
 
@@ -226,6 +385,7 @@ def _classify_regions(rows: list[dict[str, Any]], separator_by_page: Mapping[int
     for page_no, page_rows in by_page.items():
         page_rows.sort(key=lambda row: int(row.get("input_order") or 0))
         page_height = max(float(row.get("page_height_px") or 0) for row in page_rows)
+        page_width = max(float(row.get("page_width_px") or 0) for row in page_rows)
         body_sizes = [
             float(row.get("native_pdf_median_font_size") or 0)
             for row in page_rows
@@ -236,13 +396,37 @@ def _classify_regions(rows: list[dict[str, Any]], separator_by_page: Mapping[int
         separator = separator_by_page.get(page_no)
         scale = PDF_DPI / 72.0
         separator_px = float(separator) * scale if separator is not None else None
-        seeds = [
-            row
-            for row in page_rows
-            if _looks_like_label(str(row.get("raw_transcription") or ""))
-            and _row_y(row) >= page_height * 0.50
-            and float(row.get("native_pdf_median_font_size") or body_size) <= body_size * 1.15
-        ]
+        seeds: list[dict[str, Any]] = []
+        for row in page_rows:
+            if row.get("detached_pdf_reference"):
+                continue
+            text = str(row.get("raw_transcription") or "")
+            match = _NOTE_LABEL_RE.match(text)
+            if match is None:
+                continue
+            _note_id_value, start, end = _label_match(match)
+            typographic, _label_size = _label_is_typographic(
+                row, start=start, end=end, body_size=body_size
+            )
+            y = _row_y(row)
+            x = float((row.get("line_bbox_px") or {}).get("x0") or 0)
+            if (
+                y < page_height * 0.50
+                or y >= page_height * 0.94
+                or x > page_width * 0.45
+                or float(row.get("native_pdf_median_font_size") or body_size)
+                > body_size * 1.15
+            ):
+                continue
+            if separator_px is not None:
+                if (
+                    y < separator_px - max(2.0, page_height * 0.004)
+                    and not typographic
+                ):
+                    continue
+            elif not typographic:
+                continue
+            seeds.append(row)
         note_cut = None
         if seeds:
             first_label_y = min(_row_y(row) for row in seeds)
@@ -254,7 +438,7 @@ def _classify_regions(rows: list[dict[str, Any]], separator_by_page: Mapping[int
             note_cut = (
                 separator_cut
                 if separator_cut is not None
-                and 0 <= first_label_y - separator_cut <= page_height * 0.10
+                and 0 <= first_label_y - separator_cut <= page_height * 0.15
                 else first_label_y
             )
 
@@ -309,10 +493,10 @@ def _extract_rows(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[int, float
         page_count = document.page_count
         for page_no in range(1, page_count + 1):
             page = document.load_page(page_no - 1)
-            separators[page_no] = _separator_y(page)
             page_rows = _local_page_rows(
                 page, pdf_page=page_no, article=article
             )
+            separators[page_no] = _separator_y(page) if page_rows else None
             rows.extend(page_rows)
 
     for order, row in enumerate(rows, start=1):
@@ -321,6 +505,7 @@ def _extract_rows(pdf_path: Path) -> tuple[list[dict[str, Any]], dict[int, float
         row["article_id"] = str(article["article_id"])
         row["dataset"] = str(article["dataset"])
 
+    _associate_detached_references(rows, separators)
     _classify_regions(rows, separators)
     body_sizes = [
         float(row.get("native_pdf_median_font_size") or 0)
@@ -373,7 +558,21 @@ def _reference_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for row in rows:
+        if row.get("region_type") != "body":
+            continue
         text = str(row.get("raw_transcription") or "")
+        for detached in row.get("detached_pdf_references") or ():
+            candidates.append({
+                "note_id": str(detached.get("note_id") or ""),
+                "selected_text": str(detached.get("selected_text") or ""),
+                "pdf_page": row.get("pdf_page"),
+                "reading_order_index": row.get("reading_order_index"),
+                "start_offset": int(detached.get("start_offset") or 0),
+                "end_offset": int(detached.get("end_offset") or 0),
+                "line_id": row.get("line_id", ""),
+                "line_text": text,
+                "region_type": row.get("region_type"),
+            })
         label_match = _NOTE_LABEL_RE.match(text)
         label_span = _label_match(label_match)[1:] if label_match else None
         spans: list[tuple[int, int, str]] = []
@@ -411,41 +610,6 @@ def _reference_candidates(
     return candidates
 
 
-def _numeric_label_backbone(
-    labels: Sequence[dict[str, Any]],
-) -> set[int]:
-    """Return the strongest consecutive label run, preserving label-only gaps."""
-
-    best_by_value: dict[int, tuple[tuple[int, int], tuple[int, ...]]] = {}
-    best: tuple[tuple[int, int], tuple[int, ...]] = ((0, 0), ())
-    for index, label in enumerate(labels):
-        raw = str(label["note_id"])
-        if not raw.isdigit():
-            continue
-        value = int(raw)
-        quality = (
-            2 * bool(label.get("typographic_label"))
-            + (1 if label.get("region_type") == "footnote" else 0)
-        )
-        state: tuple[tuple[int, int], tuple[int, ...]] | None = None
-        if value == 1:
-            state = ((1, quality), (index,))
-        previous = best_by_value.get(value - 1)
-        if previous is not None:
-            score, chain = previous
-            extended = ((score[0] + 1, score[1] + quality), (*chain, index))
-            if state is None or extended[0] > state[0]:
-                state = extended
-        if state is None:
-            continue
-        existing = best_by_value.get(value)
-        if existing is None or state[0] > existing[0]:
-            best_by_value[value] = state
-        if state[0] > best[0]:
-            best = state
-    return set(best[1]) if best[0][0] >= 2 else set()
-
-
 def _simple_pair(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Pair PDF labels and references deterministically, without network or AI."""
 
@@ -458,30 +622,31 @@ def _simple_pair(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]
     body_size = median(body_sizes) if body_sizes else 10.0
     label_candidates: list[dict[str, Any]] = []
     for row in rows:
+        if (
+            row.get("region_type") != "footnote"
+            or row.get("detached_pdf_reference")
+        ):
+            continue
         text = str(row.get("raw_transcription") or "")
         match = _NOTE_LABEL_RE.match(text)
         if not match:
             continue
         note_id, start, end = _label_match(match)
-        label_spans = [
-            span
-            for span in row.get("native_pdf_span_styles") or ()
-            if int(span.get("start") or 0) < end
-            and int(span.get("end") or 0) > start
-        ]
-        line_size = float(row.get("native_pdf_median_font_size") or 0)
-        label_size = min(
-            (float(span.get("size") or 0) for span in label_spans),
-            default=line_size,
+        typographic_label, label_size = _label_is_typographic(
+            row, start=start, end=end, body_size=body_size
         )
-        typographic_label = any(
-            "superscript" in set(span.get("styles") or ())
-            or (
-                line_size > 0
-                and 0 < float(span.get("size") or 0) <= line_size * 0.75
-            )
-            for span in label_spans
-        ) or 0 < label_size <= body_size * 0.75
+        if text[end:end + 1] == "," and not typographic_label:
+            continue
+        page_height = float(row.get("page_height_px") or 0)
+        page_width = float(row.get("page_width_px") or 0)
+        row_box = row.get("line_bbox_px") or {}
+        if (
+            page_height > 0
+            and page_width > 0
+            and _row_y(row) >= page_height * 0.91
+            and float(row_box.get("x0") or 0) >= page_width * 0.50
+        ):
+            continue
         label_candidates.append({
             "note_id": note_id,
             "selected_text": text[start:end],
@@ -502,27 +667,25 @@ def _simple_pair(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]
 
     assigned: list[tuple[dict[str, Any], int]] = []
     for ref in _reference_candidates(rows):
-        options = candidates_by_note.get(str(ref["note_id"]), ())
+        ref_page = int(ref.get("pdf_page") or 0)
+        options = [
+            index
+            for index in candidates_by_note.get(str(ref["note_id"]), ())
+            if int(label_candidates[index].get("pdf_page") or 0) == ref_page
+        ]
         if not options:
             continue
-        ref_page = int(ref.get("pdf_page") or 0)
         ref_order = int(ref.get("reading_order_index") or 0)
         label_index = min(
             options,
             key=lambda index: (
                 not bool(label_candidates[index].get("typographic_label")),
-                int(label_candidates[index].get("pdf_page") or 0) < ref_page,
-                abs(
-                    int(label_candidates[index].get("pdf_page") or 0)
-                    - ref_page
-                ),
                 int(label_candidates[index].get("reading_order_index") or 0)
                 < ref_order,
                 abs(
                     int(label_candidates[index].get("reading_order_index") or 0)
                     - ref_order
                 ),
-                label_candidates[index].get("region_type") != "footnote",
             ),
         )
         assigned.append((ref, label_index))
@@ -531,8 +694,9 @@ def _simple_pair(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]
     for ref, label_index in assigned:
         assigned_by_label.setdefault(label_index, []).append(ref)
 
+    # PDF intake is deliberately footnote-only: every materialized label must
+    # have a body reference on the same physical page.
     selected = set(assigned_by_label)
-    selected.update(_numeric_label_backbone(label_candidates))
     ordered_selected = sorted(
         selected,
         key=lambda index: (
@@ -582,8 +746,9 @@ def _simple_pair(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]
     markers.sort(key=_marker_order)
     pair_count = len({_pair_id(marker) for marker in refs})
     return markers, {
-        "schema_version": "alr.pdf_intake.deterministic_pairing.v1",
+        "schema_version": "alr.pdf_intake.deterministic_pairing.v2",
         "engine": "alr.pdf_intake.deterministic_pairing",
+        "scope": "same_page_footnotes",
         "marker_count": len(markers),
         "pair_count": pair_count,
         "label_only_count": len(labels) - pair_count,
@@ -619,13 +784,6 @@ def _refine_regions_from_pairs(
 
     for page, page_rows in by_page.items():
         page_height = max(float(row.get("page_height_px") or 0) for row in page_rows)
-        upper_sizes = [
-            float(row.get("native_pdf_median_font_size") or 0)
-            for row in page_rows
-            if _row_y(row) < page_height * 0.65
-            and 4.0 <= float(row.get("native_pdf_median_font_size") or 0) <= 20.0
-        ]
-        body_size = median(upper_sizes) if upper_sizes else 10.0
         separator = separator_by_page.get(page)
         separator_cut = (
             float(separator) * (PDF_DPI / 72.0) + max(2.0, page_height * 0.004)
@@ -641,24 +799,7 @@ def _refine_regions_from_pairs(
                 else first_label_y
             )
         else:
-            below_separator = [
-                row
-                for row in page_rows
-                if separator_cut is not None and _row_y(row) >= separator_cut
-            ]
-            small_rows = [
-                row
-                for row in below_separator
-                if 0 < float(row.get("native_pdf_median_font_size") or 0)
-                <= body_size * 0.85
-            ]
-            note_cut = (
-                separator_cut
-                if separator_cut is not None
-                and len(small_rows) >= 2
-                and len(small_rows) / max(1, len(below_separator)) >= 0.75
-                else None
-            )
+            note_cut = None
 
         for row in page_rows:
             is_note = note_cut is not None and _row_y(row) >= note_cut
@@ -681,6 +822,28 @@ def _materialize_footnotes(
     rows: Sequence[dict[str, Any]], markers: Sequence[dict[str, Any]]
 ) -> tuple[list[tuple[int, str]], dict[str, int]]:
     ordered_rows = sorted(rows, key=lambda row: int(row.get("input_order") or 0))
+    page_by_order = {
+        int(row.get("input_order") or 0): int(row.get("pdf_page") or 0)
+        for row in ordered_rows
+    }
+    footnote_rows_by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in ordered_rows:
+        if row.get("region_type") == "footnote":
+            footnote_rows_by_page.setdefault(
+                int(row.get("pdf_page") or 0), []
+            ).append(row)
+    footnote_orders_by_page = {
+        page: [int(row.get("input_order") or 0) for row in page_rows]
+        for page, page_rows in footnote_rows_by_page.items()
+    }
+
+    def marker_page(marker: Mapping[str, Any]) -> int:
+        return int(
+            marker.get("pdf_page")
+            or page_by_order.get(_marker_order(marker))
+            or 0
+        )
+
     label_markers = sorted(
         [marker for marker in markers if marker.get("role") == "fn_label" and marker.get("safe_to_use", True)],
         key=_marker_order,
@@ -703,13 +866,24 @@ def _materialize_footnotes(
         if note_counts.get(note_id) == 1:
             internal_by_marker[f"note:{note_id}"] = index
         start_order = _marker_order(marker)
-        stop_order = _marker_order(label_markers[index]) if index < len(label_markers) else None
-        chunk = [
-            row for row in ordered_rows
-            if start_order <= int(row.get("input_order") or 0)
-            and (stop_order is None or int(row.get("input_order") or 0) < stop_order)
-            and row.get("region_type") == "footnote"
-        ]
+        page = marker_page(marker)
+        stop_order = next(
+            (
+                _marker_order(next_marker)
+                for next_marker in label_markers[index:]
+                if marker_page(next_marker) == page
+            ),
+            None,
+        )
+        page_rows = footnote_rows_by_page.get(page, [])
+        page_orders = footnote_orders_by_page.get(page, [])
+        start_index = bisect_left(page_orders, start_order)
+        stop_index = (
+            bisect_left(page_orders, stop_order)
+            if stop_order is not None
+            else len(page_rows)
+        )
+        chunk = page_rows[start_index:stop_index]
         first_line_id = str(marker.get("line_id") or "")
         parts: list[str] = []
         footer_pages: set[int] = set()
@@ -752,6 +926,7 @@ def _body_paragraphs(
         int(row.get("input_order") or 0): row
         for row in rows
         if row.get("region_type") == "body"
+        and not row.get("exclude_from_body")
         and not (
             float(row.get("page_height_px") or 0) > 0
             and float((row.get("line_bbox_px") or {}).get("y0") or 0)
@@ -817,7 +992,8 @@ def inspect_pdf(pdf_path: str | Path) -> PdfIntakeResult:
     if not footnotes:
         raise ValueError(
             "No footnote labels were detected in the PDF. "
-            "This experimental intake currently requires visible numbered or symbol notes."
+            "Experimental PDF intake supports visible bottom-of-page footnotes "
+            "with references on the same page; endnotes are not supported."
         )
     if not paragraphs:
         raise ValueError("The PDF intake found footnotes but no readable body text.")
