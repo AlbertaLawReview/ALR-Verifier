@@ -1841,18 +1841,23 @@ class ALRQuoteVerifierGUI:
             "Footnote sentence uses one sentence around the footnote marker. "
             "Passage since prior note uses all body text since the previous marker.",
         ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(adv_card, text="Footnote filter:", style="Card.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
-        fn_row = ttk.Frame(adv_card, style="Card.TFrame")
-        fn_row.grid(row=2, column=1, sticky=tk.W, padx=(8, 0), pady=(8, 0))
-        ttk.Entry(fn_row, textvariable=self.fn_filter_var, width=16).pack(side=tk.LEFT)
-        _info_dot(fn_row, "Only process these footnotes, e.g. 1,4,10-12. Leave empty for all.").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            proposition_row, text="Footnote filter:", style="Card.TLabel",
+        ).pack(side=tk.LEFT, padx=(18, 6))
+        ttk.Entry(
+            proposition_row, textvariable=self.fn_filter_var, width=16,
+        ).pack(side=tk.LEFT)
+        _info_dot(
+            proposition_row,
+            "Only process these footnotes, e.g. 1,4,10-12. Leave empty for all.",
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(
             adv_card, text="Cache model responses (LLM cache)",
             variable=self.llm_cache_var, style="Card.TCheckbutton",
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         advanced_flags = ttk.Frame(adv_card, style="Card.TFrame")
         advanced_flags.grid(
-            row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0)
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0)
         )
         ttk.Checkbutton(
             advanced_flags, text="Log to terminal only",
@@ -1869,7 +1874,7 @@ class ALRQuoteVerifierGUI:
             "references, not endnotes. Leave this off for the standard DOCX workflow.",
         ).pack(side=tk.LEFT, padx=(6, 0))
         detail_row = ttk.Frame(adv_card, style="Card.TFrame")
-        detail_row.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        detail_row.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         ttk.Checkbutton(
             detail_row, text="Show the raw engine log in Activity",
             variable=self.detail_log_var, style="Card.TCheckbutton",
