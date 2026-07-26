@@ -34,8 +34,8 @@ source .venv/bin/activate. Add or drag one or more DOCX files into the window,
 choose the settings, and press Run. Review workbooks are written to
 CHECKED_EDITS by default.
 
-PDF intake is experimental on this branch. It uses a self-contained,
-deterministic PyMuPDF module for native text and footnote pairing. Enable it
+PDF intake is experimental. It uses a deterministic PyMuPDF 
+module for native text and footnote pairing. Enable it
 under **Settings → Advanced → Enable experimental PDF input**. PDFs with
 unusual layouts should be reviewed carefully. This mode supports
 bottom-of-page footnotes whose references are on the same page; it does not
