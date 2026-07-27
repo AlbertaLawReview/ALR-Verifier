@@ -7268,20 +7268,30 @@ def _textual_pinpoint_from_link_or_fragments(link: str, fragments: Any = None) -
     return ""
 
 
-def _first_page_pinpoint(row: Dict[str, Any]) -> Optional[int]:
+def _page_pinpoints_for_row(row: Dict[str, Any]) -> List[int]:
     raw = row.get("page_pinpoints")
     if not raw:
-        return None
+        return []
     try:
-        values = json.loads(raw) if isinstance(raw, str) else list(raw)
+        values = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
-        return None
-    if not isinstance(values, list) or not values:
-        return None
-    try:
-        return int(values[0])
-    except (TypeError, ValueError):
-        return None
+        return []
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+    pages: List[int] = []
+    for value in values:
+        try:
+            page = int(value)
+        except (TypeError, ValueError):
+            continue
+        if page not in pages:
+            pages.append(page)
+    return pages
+
+
+def _first_page_pinpoint(row: Dict[str, Any]) -> Optional[int]:
+    pages = _page_pinpoints_for_row(row)
+    return pages[0] if pages else None
 
 
 def _journal_page_pinpoint_for_row(row: Dict[str, Any]) -> str:
@@ -7365,9 +7375,12 @@ def _journal_db_pages_for_quote(
 
 
 def _page_marker_pinpoint_for_quote(
-    text: str, quote_text: str, min_score: float = 0.0
+    text: str,
+    quote_text: str,
+    min_score: float = 0.0,
+    preferred_pages: Iterable[int] = (),
 ) -> str:
-    """Resolve one printed page or an adjacent-page range for a quote."""
+    """Resolve printed page locations, preferring a matching cited page."""
     spans = _journal_db_page_spans(text)
     if not spans:
         return ""
@@ -7393,7 +7406,7 @@ def _page_marker_pinpoint_for_quote(
             source_words.append(_quote_source_alignment_token(token, aliases))
             source_pages.append(label)
 
-    paths: set[Tuple[str, ...]] = set()
+    paths: List[Tuple[str, ...]] = []
     width = len(quote_words)
     if width and width <= len(source_words):
         for index in range(len(source_words) - width + 1):
@@ -7403,21 +7416,27 @@ def _page_marker_pinpoint_for_quote(
             for label in source_pages[index:index + width]:
                 if not labels or labels[-1] != label:
                     labels.append(label)
-            if labels:
-                paths.add(tuple(labels))
+            path = tuple(labels)
+            if path and path not in paths:
+                paths.append(path)
 
-    if len(paths) == 1:
-        labels = next(iter(paths))
-        if len(labels) == 1:
-            return f"page {labels[0]}"
-        if labels[0] != labels[-1]:
-            return f"pages {labels[0]}\u2013{labels[-1]}"
-        return ""
     if paths:
-        return ""
+        preferred = {str(page) for page in preferred_pages}
+        preferred_paths = [
+            path for path in paths if any(label in preferred for label in path)
+        ]
+        selected = preferred_paths or paths
+        return _format_pinpoint_summary([
+            f"page {path[0]}"
+            if len(path) == 1
+            else f"pages {path[0]}\u2013{path[-1]}"
+            for path in selected
+        ])
 
     pages = _journal_db_pages_for_quote(text, quote_text, min_score=min_score)
-    return pages[0] if len(pages) == 1 else ""
+    preferred = {f"page {page}" for page in preferred_pages}
+    preferred_matches = [page for page in pages if page in preferred]
+    return _format_pinpoint_summary(preferred_matches or pages)
 
 
 def _page_label_from_match_pinpoint(value: str) -> Optional[int]:
@@ -7970,12 +7989,13 @@ def _apply_quote_checks(
         a2aj_scopes = _a2aj_pinpoint_scope.CitedScopes()
         a2aj_resolutions: Dict[str, _a2aj_pinpoint_scope.QuoteResolution] = {}
         journal_db_full_text = ""
+        cited_pages = _page_pinpoints_for_row(row)
         article_id = _journal_article_id_for_row(row)
         if article_id:
             db_text = journal_search.get_article_text(article_id).strip()
             if db_text:
                 journal_db_full_text = db_text
-                cited_page = _first_page_pinpoint(row)
+                cited_page = cited_pages[0] if cited_pages else None
                 cited_page_text = _journal_db_page_text(db_text, cited_page)
                 if cited_page_text:
                     cited_page_score = max(
@@ -8341,6 +8361,7 @@ def _apply_quote_checks(
                     journal_db_full_text or anchor_text,
                     qt,
                     min_score=strong_match,
+                    preferred_pages=cited_pages,
                 )
 
             current_pinpoint = nonlocal_pin["v"]

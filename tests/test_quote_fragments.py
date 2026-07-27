@@ -788,7 +788,7 @@ class QuoteFragmentTests(unittest.TestCase):
         self.assertEqual(rows[0]["quote_check_status"], "OG_PINPOINT_MATCH")
         self.assertEqual(rows[0]["quote_match_pinpoint"], "page 149")
 
-    def test_apply_quote_checks_keeps_repeated_full_source_page_match_unknown(self):
+    def test_apply_quote_checks_reports_repeated_full_source_page_matches(self):
         quote = "the repeated constitutional phrase"
         rows = [{
             "footnote_id": 1,
@@ -810,7 +810,32 @@ class QuoteFragmentTests(unittest.TestCase):
             verifier._apply_quote_checks(rows, quotes)
 
         self.assertEqual(rows[0]["quote_check_status"], "OG_PINPOINT_MATCH")
-        self.assertEqual(rows[0]["quote_match_pinpoint"], "")
+        self.assertEqual(rows[0]["quote_match_pinpoint"], "page 149, page 150")
+
+    def test_apply_quote_checks_prefers_matching_cited_page_for_repeated_quote(self):
+        quote = "the repeated constitutional phrase"
+        rows = [{
+            "footnote_id": 1,
+            "citation_part_index": 1,
+            "citation_part_kind": "case",
+            "citation_part_link": "https://decisions.example.test/case",
+            "page_pinpoints": [150],
+            "_citation_part_full_source_text": (
+                f"[Page 149]\n{quote}.\n"
+                f"[Page 150]\n{quote}."
+            ),
+        }]
+        quotes = {1: [{
+            "quote_inner": quote,
+            "quote_raw": f'"{quote}"',
+            "quote_delimiter_style": "STRAIGHT",
+        }]}
+
+        with mock.patch.object(verifier, "USE_A2AJ", False):
+            verifier._apply_quote_checks(rows, quotes)
+
+        self.assertEqual(rows[0]["quote_check_status"], "OG_PINPOINT_MATCH")
+        self.assertEqual(rows[0]["quote_match_pinpoint"], "page 150")
 
     def test_apply_quote_checks_reports_cross_page_full_source_range(self):
         quote = (

@@ -151,6 +151,16 @@ def test_journal_page_recovery_uses_quote_match_threshold():
     ) == ["page 449"]
 
 
+def test_page_marker_repetitions_use_existing_pinpoint_summary():
+    text = "".join(
+        f"[page {page}]\nRepeated phrase.\n"
+        for page in (439, 441, 443)
+    )
+    assert aqv._page_marker_pinpoint_for_quote(text, "Repeated phrase.") == (
+        "page 439, page 441 [+1 more instances]"
+    )
+
+
 def test_page_range_link_uses_first_printed_page():
     assert aqv._page_label_from_match_pinpoint("pages 149\u2013150") == 149
 
