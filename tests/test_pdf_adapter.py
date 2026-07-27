@@ -1026,6 +1026,60 @@ def test_pdf_footnote_materialization_never_crosses_a_page_boundary():
     assert footnotes == [(1, "Same-page text.")]
 
 
+def test_pdf_page_number_footer_is_not_appended_to_last_footnote():
+    rows = [
+        {
+            "input_order": 1,
+            "reading_order_index": 1,
+            "pdf_page": 28,
+            "line_id": "note",
+            "region_type": "footnote",
+            "raw_transcription": (
+                "67 Alberta Personal Property Bill of Rights, "
+                "RSA 2000, c A-31 (Book of Authorities TAB 22)"
+            ),
+            "line_bbox_px": {
+                "x0": 144.0, "y0": 1416.42, "x1": 942.69, "y1": 1439.44,
+            },
+            "page_width_px": 1224.0,
+            "page_height_px": 1584.0,
+        },
+        {
+            "input_order": 2,
+            "reading_order_index": 2,
+            "pdf_page": 28,
+            "line_id": "page-number",
+            "region_type": "footnote",
+            "raw_transcription": "26",
+            "line_bbox_px": {
+                "x0": 1055.54, "y0": 1451.71, "x1": 1086.11, "y1": 1476.28,
+            },
+            "page_width_px": 1224.0,
+            "page_height_px": 1584.0,
+        },
+    ]
+    markers = [{
+        "role": "fn_label",
+        "note_id": "67",
+        "materialized_pair_id": "pair-67",
+        "reading_order_index": 1,
+        "pdf_page": 28,
+        "line_id": "note",
+        "end_offset": 2,
+        "safe_to_use": True,
+    }]
+
+    pdf_adapter._refine_regions_from_pairs(rows, {28: 650.0}, markers)
+    footnotes, _lookup = pdf_adapter._materialize_footnotes(rows, markers)
+
+    assert rows[1]["region_type"] == "footer"
+    assert footnotes == [(
+        1,
+        "Alberta Personal Property Bill of Rights, RSA 2000, c A-31 "
+        "(Book of Authorities TAB 22)",
+    )]
+
+
 @pytest.mark.parametrize("symbol", ["*", "†", "‡", "§", "#"])
 def test_local_fallback_pairs_symbol_callouts(symbol):
     rows = [

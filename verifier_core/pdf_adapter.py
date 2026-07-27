@@ -384,6 +384,22 @@ def _looks_like_label(text: str) -> bool:
     return bool(_NOTE_LABEL_RE.match(text or ""))
 
 
+def _looks_like_page_number_footer(row: Mapping[str, Any]) -> bool:
+    text = str(row.get("raw_transcription") or "").strip()
+    if not re.fullmatch(r"\d{1,4}", text):
+        return False
+    page_height = float(row.get("page_height_px") or 0)
+    page_width = float(row.get("page_width_px") or 0)
+    box = row.get("line_bbox_px") or {}
+    x0 = float(box.get("x0") or 0)
+    x1 = float(box.get("x1") or 0)
+    y0 = float(box.get("y0") or 0)
+    if page_height <= 0 or page_width <= 0 or y0 < page_height * 0.90:
+        return False
+    center = (x0 + x1) / 2
+    return x0 >= page_width * 0.75 or abs(center - page_width / 2) <= page_width * 0.08
+
+
 def _classify_regions(rows: list[dict[str, Any]], separator_by_page: Mapping[int, float | None]) -> None:
     by_page: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
@@ -450,6 +466,12 @@ def _classify_regions(rows: list[dict[str, Any]], separator_by_page: Mapping[int
             )
 
         for row in page_rows:
+            if _looks_like_page_number_footer(row):
+                row["region_type"] = "footer"
+                row["line_type"] = "footer"
+                row["coarse_label"] = "footer"
+                row["exclude_from_body"] = True
+                continue
             is_note = note_cut is not None and _row_y(row) >= note_cut
             if is_note:
                 row["region_type"] = "footnote"
@@ -901,6 +923,12 @@ def _refine_regions_from_pairs(
             note_cut = None
 
         for row in page_rows:
+            if _looks_like_page_number_footer(row):
+                row["region_type"] = "footer"
+                row["line_type"] = "footer"
+                row["coarse_label"] = "footer"
+                row["exclude_from_body"] = True
+                continue
             is_note = note_cut is not None and _row_y(row) >= note_cut
             row["region_type"] = "footnote" if is_note else "body"
             row["line_type"] = "footnote" if is_note else "paragraph"

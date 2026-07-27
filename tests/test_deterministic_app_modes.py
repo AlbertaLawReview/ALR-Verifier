@@ -90,6 +90,44 @@ def test_free_mode_uses_recall_first_semicolon_parts():
     ]
 
 
+def test_free_adapter_strips_authority_tab_and_pdf_footer_from_law_identity():
+    text = (
+        "Alberta Personal Property Bill of Rights, RSA 2000, c A-31 "
+        "(Book of Authorities TAB 22) 26"
+    )
+    with patch.object(aqv, "_resolve_footnote_part_link", side_effect=_identity_link):
+        result = aqv._deterministic_footnote_parts(
+            text, allow_unsplit_fallback=True
+        )
+
+    assert result is not None
+    assert len(result[0]) == 1
+    assert result[0][0].kind == "statute"
+    assert result[0][0].bare_citation == "RSA 2000, c A-31"
+    assert aqv._a2aj_query_citation(text) == (
+        "Alberta Personal Property Bill of Rights, RSA 2000, c A-31"
+    )
+
+
+def test_free_adapter_keeps_numbered_corporate_case_as_one_clean_identity():
+    text = (
+        "1068490 Ontario Ltd. V. Marlin Center Mobile Homes Inc. and "
+        "Howard Geisler, 2001 CarswellOnt 4564, at para. 21 "
+        "(Book of Authorities TAB 17)"
+    )
+    with patch.object(aqv, "_resolve_footnote_part_link", side_effect=_identity_link):
+        result = aqv._deterministic_footnote_parts(
+            text, allow_unsplit_fallback=True
+        )
+
+    assert result is not None
+    assert len(result[0]) == 1
+    assert result[0][0].kind == "case"
+    assert result[0][0].bare_citation == (
+        "2001 CarswellOnt 4564, at para. 21"
+    )
+
+
 def test_hrto_neutral_citation_builds_canlii_url():
     assert aqv._generate_fallback_url(
         "XY v Ontario (Government and Consumer Services), 2012 HRTO 726",
@@ -221,6 +259,36 @@ def test_workbook_does_not_call_populated_pinpoint_missing():
         value = sheet.cell(2, headers.index("Corrected quote") + 1).value
         workbook.close()
     assert "No match found" in value
+    assert "No pinpoint provided" not in value
+
+
+def test_workbook_never_reports_no_pinpoint_provided():
+    import openpyxl
+
+    row = {
+        "footnote_id": 1,
+        "footnote_display_id": "1",
+        "footnote_full": "Example footnote.",
+        "proposition_text": 'A proposition with "quoted text".',
+        "citation_part_text": "Example citation.",
+        "has_quotes": "YES",
+        "quote_check_status": "NO_MATCH",
+        "quote_check_notes": "",
+        "quote_corrected_citation": '"quoted text"',
+        "citation_part_link": "https://example.test/source",
+        "pinpoint_fragments": "[]",
+        "page_pinpoints": "[]",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        path = f"{directory}\\result.xlsx"
+        aqv.write_workbook({"footnote_rows": [row]}, path)
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        sheet = workbook["FootnoteReferences"]
+        headers = [cell.value for cell in sheet[1]]
+        value = sheet.cell(2, headers.index("Corrected quote") + 1).value
+        workbook.close()
+
+    assert value == "❌No match found❌"
     assert "No pinpoint provided" not in value
 
 

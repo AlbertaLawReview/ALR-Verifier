@@ -524,6 +524,16 @@ def _sentence_starts(text: str) -> list[int]:
         if _inside_quotes(text, match.start()):
             continue
         prefix = text[:match.start() + 1]
+        suffix = text[match.end():]
+        if (
+            re.search(
+                r"\b(?:Ltd|Inc|Corp|Co|LLC|LLP)\.$",
+                prefix,
+                re.IGNORECASE,
+            )
+            and re.match(r"v\.?(?:\s|$)", suffix, re.IGNORECASE)
+        ):
+            continue
         if re.search(r"(?:\be\.g|\bi\.e|\bcf|\bno|\bv|\bpara|\bart|\b[A-Z])\.$", prefix, re.I):
             continue
         starts.append(match.end())

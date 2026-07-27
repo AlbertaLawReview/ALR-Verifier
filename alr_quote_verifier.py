@@ -1164,6 +1164,17 @@ def _normalized_a2aj_document_text(
     return normalized
 
 
+_CITATION_ADMINISTRATIVE_TAIL_RE = re.compile(
+    r"\s*\(\s*(?:Book\s+of\s+Authorities\s*,?\s*)?TAB\s+[A-Za-z0-9.-]+\s*\)"
+    r"(?:\s+\d{1,4})?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_citation_administrative_tail(value: str) -> str:
+    return _CITATION_ADMINISTRATIVE_TAIL_RE.sub("", str(value or "")).strip()
+
+
 def _a2aj_query_citation(bare: str) -> str:
     """Trim a bare citation to what A2AJ's /fetch matcher accepts: it rejects
     citations carrying pinpoints, so drop the pinpoint (and anything after
@@ -1171,6 +1182,7 @@ def _a2aj_query_citation(bare: str) -> str:
     Structural parentheticals such as (2nd Supp) are part of the citation
     and must stay."""
     text = re.sub(r"\s+", " ", str(bare or "")).strip()
+    text = _strip_citation_administrative_tail(text)
     text = re.sub(
         r"\s+at\s+(?:(?:p{1,2}|paras?|(?:sub)?sections?|ss?|rules?|rr?|"
         r"arts?|articles?)\.?\s*)?\d.*$",
@@ -1216,6 +1228,8 @@ def _fetch_a2aj_source_text_for_row(
     bare: str = "",
     kind: str = "",
     register_url: Optional[str] = None,
+    *,
+    capture_document: bool = False,
 ) -> str:
     """Fetch exact A2AJ text and retain its evidence on the row.
 
@@ -1258,6 +1272,9 @@ def _fetch_a2aj_source_text_for_row(
     source_kind = "law" if kind in ("statute", "gazette") else "case"
     text, structure = _a2aj_document_evidence(document, source_kind)
     if text:
+        if capture_document:
+            row["_a2aj_document"] = document
+            row["_a2aj_evidence_text"] = text
         row["_a2aj_identity_locked"] = True
         row["_a2aj_structure"] = structure
         row["_a2aj_structure_status"] = structure.get("status", "unavailable")
@@ -3351,7 +3368,7 @@ def _a2aj_has_law_before_browser(
         "citation_part_kind": "statute",
         "citation_part_link": link_candidate,
     }
-    if not _fetch_a2aj_source_text_for_row(probe):
+    if not _fetch_a2aj_source_text_for_row(probe, capture_document=True):
         return None
     _ts_print(f"  A2AJ source available: {_a2aj_query_citation(citation_text)}")
     return probe
@@ -3456,6 +3473,23 @@ def _resolve_footnote_part_link_unlocked(
                 citation_with_style or verbatim, first_pf, normalized_kind
             ) or _a2aj_official_law_url(law_probe)
             if link:
+                document = law_probe.pop("_a2aj_document", None)
+                evidence_text = str(
+                    law_probe.pop("_a2aj_evidence_text", "") or ""
+                )
+                base, _fragment = _split_url(link)
+                if (
+                    document is not None
+                    and base
+                    and _a2aj_url_matches_document(base, document, "law")
+                ):
+                    _register_a2aj_document(
+                        base,
+                        document,
+                        "law",
+                        structure=law_probe.get("_a2aj_structure") or {},
+                        evidence_text=evidence_text,
+                    )
                 if constructed_link:
                     _ts_print(
                         "  A2AJ current-law identity lock: "
@@ -3927,6 +3961,7 @@ def _parse_json_payload(raw_text: str) -> Optional[Dict[str, Any]]:
 _BARE_SUPRA_RE = re.compile(r"\b(supra\s+note\s+\d+|ibid)\b", re.IGNORECASE)
 _BARE_CASE_CIT_RE = re.compile(
     r"(\[\d{4}\]\s|\(\d{4}\)[\s,]|\b[12]\d{3}\s+(?:CanLII|[A-Z]{2,7})\s+\d+"
+    r"|\b[12]\d{3}\s+Carswell[A-Za-z]+\s+\d+"
     r"|\b\d+\s+US\s+\d+|\b\d+\s+F\s*\(?\d*[a-z]*\)?\s+\d+)"
 )
 _BARE_STATUTE_RE = re.compile(
@@ -3967,6 +4002,7 @@ def _derive_bare_citation(citation_with_style: str, kind: str) -> str:
         s = s2
 
     def _final(x: str) -> str:
+        x = _strip_citation_administrative_tail(x)
         x = _BARE_TRAIL_SHORTFORM_RE.sub("", x.strip())
         return x.rstrip(".").strip()
 
@@ -8216,6 +8252,19 @@ def _apply_quote_checks(
                             and scoped_resolution.location != "unmatched"
                         ):
                             resolution = scoped_resolution
+                    if (
+                        len(_quote_word_tokens(qt)) < 3
+                        and resolution.location.startswith("alternate")
+                        and not resolution.labels
+                    ):
+                        # A one- or two-word hit outside the cited scope is not
+                        # enough evidence to report a match without a pinpoint.
+                        resolution = replace(
+                            resolution,
+                            location="unmatched",
+                            score=0.0,
+                            text="",
+                        )
                     a2aj_resolutions[key] = resolution
             row["_a2aj_cited_scopes"] = list(a2aj_scopes.labels)
             row["_a2aj_quote_locations"] = [
@@ -8841,12 +8890,6 @@ def write_workbook(data: Dict[str, Any], output_path: str) -> None:
                 return "❌No match found❌"
             if "No source text found" in notes:
                 return "❌Unable to grab source text❌"
-            base, frag = _split_url(link)
-            has_requested_pinpoint = bool(
-                _coerce_pinpoint_fragments(row.get("pinpoint_fragments"))
-            ) or _first_page_pinpoint(row) is not None
-            if base and not frag and not has_requested_pinpoint:
-                return "❌No pinpoint provided❌"
             return "❌No match found❌"
         if s in ("ALT_PINPOINT_MATCH_CANLII", "ALT_PINPOINT_MATCH_A2AJ"):
             return f"✓Perfect Match{_match_location_label(row)}✓"

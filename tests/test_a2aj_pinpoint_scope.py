@@ -677,6 +677,7 @@ class QuoteCheckIntegrationTests(unittest.TestCase):
             + "#par3:~:text=exact%20quotation",
         )
 
+
     def test_cited_law_section_is_fetched_when_full_structure_lacks_it(self):
         law_base = (
             "https://www.canlii.org/en/ca/laws/stat/rsc-1985-c-c-46/"
@@ -883,6 +884,47 @@ class QuoteCheckIntegrationTests(unittest.TestCase):
         self.assertEqual(row["quote_check_status"], "ALT_PINPOINTLESS_MATCH_A2AJ")
         self.assertEqual(row["quote_match_pinpoint"], "")
         self.assertEqual(row["quote_match_link"], law_base)
+
+    def test_short_wrong_section_match_without_pinpoint_is_rejected(self):
+        law_base = (
+            "https://www.canlii.org/en/ab/laws/stat/rsa-2000-c-c-15/"
+            "latest/rsa-2000-c-c-15.html"
+        )
+        full_document = verifier.a2aj_client.A2AJDocument(
+            dataset="LEGISLATION-AB",
+            citation="RSA 2000, c C-15",
+            alternate_citation="C-15",
+            name="Civil Enforcement Act",
+            date="",
+            url="",
+            text="Unstructured legislative text containing distress outside the cited section.",
+            language="en",
+            scraped_timestamp="",
+            upstream_license="",
+            raw={},
+        )
+        verifier._register_a2aj_document(law_base, full_document, "law")
+        section_lookup = verifier.a2aj_client.A2AJLookup(
+            "found",
+            replace(full_document, text="1(1)(m) Unrelated cited-section text."),
+            "section",
+        )
+        row = {
+            "footnote_id": 1,
+            "citation_part_index": 1,
+            "citation_part_kind": "statute",
+            "citation_part_link": law_base + "#sec1",
+            "citation_with_style": "Civil Enforcement Act, RSA 2000, c C-15, s 1(1)(m)",
+            "pinpoint_fragments": ["sec1(1)(m)"],
+        }
+
+        with mock.patch.object(verifier, "USE_A2AJ", True), mock.patch.object(
+            verifier.a2aj_client, "lookup_document", return_value=section_lookup
+        ):
+            verifier._apply_quote_checks([row], {1: [self._quote("distress")]})
+
+        self.assertEqual(row["quote_check_status"], "NO_MATCH")
+        self.assertEqual(row.get("quote_match_pinpoint", ""), "")
 
     def test_strong_full_cited_law_match_beats_partial_section_response(self):
         law_base = (

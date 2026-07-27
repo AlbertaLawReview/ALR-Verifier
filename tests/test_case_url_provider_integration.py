@@ -267,6 +267,73 @@ def test_a2aj_law_source_replaces_other_with_deterministic_link():
     browser.resolve_url.assert_not_called()
 
 
+def test_a2aj_law_link_keeps_the_source_document_locked():
+    browser = mock.Mock()
+    source_url = (
+        "https://kings-printer.alberta.ca/1266.cfm?"
+        "page=A31.cfm&leg_type=Acts&display=html"
+    )
+    document = a2aj_client.A2AJDocument(
+        dataset="LEGISLATION-AB",
+        citation="RSA 2000, c A-31",
+        alternate_citation="",
+        name="Alberta Personal Property Bill of Rights",
+        date="",
+        url=source_url,
+        text="2 Restriction on legislation affecting personal property.",
+        language="en",
+        scraped_timestamp="",
+        upstream_license="",
+        raw={},
+    )
+    evidence_text = "2 Restriction on legislation affecting personal property."
+    probe = {
+        "_a2aj_dataset": document.dataset,
+        "_a2aj_citation": document.citation,
+        "_a2aj_source_url": document.url,
+        "_a2aj_language": document.language,
+        "_a2aj_structure": {"status": "usable", "type": "section", "count": 1},
+        "_a2aj_document": document,
+        "_a2aj_evidence_text": evidence_text,
+    }
+    expected = (
+        "https://www.canlii.org/en/ab/laws/stat/rsa-2000-c-a-31/"
+        "latest/rsa-2000-c-a-31.html"
+    )
+
+    with mock.patch.object(
+        verifier, "_a2aj_has_law_before_browser", return_value=probe
+    ), mock.patch.object(
+        verifier, "LINK_RESOLVER", browser
+    ), mock.patch.dict(
+        verifier._A2AJ_LOCKED_DOCUMENTS, {}, clear=True
+    ), mock.patch.dict(
+        verifier._A2AJ_LOCKED_STRUCTURES, {}, clear=True
+    ), mock.patch.dict(
+        verifier._A2AJ_LOCKED_TEXTS, {}, clear=True
+    ):
+        url = verifier._resolve_footnote_part_link_unlocked(
+            verbatim=(
+                "Alberta Personal Property Bill of Rights, "
+                "RSA 2000, c A-31 (Book of Authorities TAB 22)"
+            ),
+            citation_with_style=(
+                "Alberta Personal Property Bill of Rights, "
+                "RSA 2000, c A-31 (Book of Authorities TAB 22)"
+            ),
+            kind="statute",
+            link_candidate="other",
+            pinpoint_fragments=[],
+            bare_citation="RSA 2000, c A-31",
+        )
+        key = verifier._fragment_doc_key(expected)
+        assert verifier._A2AJ_LOCKED_DOCUMENTS[key] is document
+        assert verifier._A2AJ_LOCKED_TEXTS[key] == evidence_text
+
+    assert url == expected
+    browser.resolve_url.assert_not_called()
+
+
 def test_reporter_only_scc_a2aj_hit_prefers_canlii_database_link():
     document = a2aj_client.A2AJDocument(
         dataset="SCC",
