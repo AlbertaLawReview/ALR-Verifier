@@ -74,17 +74,9 @@ the applicable service terms. Review each service's current privacy and data
 retention policies yourself.
 
 The **A2AJ local corpus** panel can install the complete case-law and
-legislation datasets for faster local-first lookups. It checks upstream
-partition metadata for staleness, resumes interrupted downloads, and reuses
-byte-identical partitions. If an upstream Parquet file was merely serialized in
-a different row order, the update retains the existing local file after
-verifying that its rows are unchanged. Stable multi-file dataset partitions are
-also supported so upstream publishers can add shards without replacing prior
-ones. The separate **Local only** setting requires that complete corpus and
-prevents verification runs from making network requests; journal retrieval and
-the bundled reference database are already local. Installing or updating the
-corpus is an explicit network operation and currently requires about 4.9 GB of
-storage.
+legislation datasets. As of July 2026, that is about 5 GB of storage. This allows rapid local processing. 
+Once you have this downloaded, you can turn on the **Local only** setting to verify documents 
+100% locally/offline.
 
 ## Windows package
 
