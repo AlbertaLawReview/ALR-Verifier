@@ -37,9 +37,8 @@ CHECKED_EDITS by default.
 PDF intake is experimental. It uses the deterministic legal-PDF engine for
 native text, page structure, footnotes, endnotes, and cross-page note bodies.
 Enable it under **Settings → Advanced → Enable experimental PDF input**.
-Scanned PDFs use Tesseract OCR when it is installed; set
-`LEGALPDF_TESSERACT_COMMAND` if the executable is outside a standard location.
-OCR and unusual layouts should be reviewed carefully.
+Image-only and scanned PDFs are not supported. Unusual layouts should be
+reviewed carefully.
 
 An OpenAI API key is required for modes that use AI. Enter it when prompted or
 set OPENAI_API_KEY. A key entered in the Windows application is encrypted for
