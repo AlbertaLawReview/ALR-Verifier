@@ -75,15 +75,15 @@ retention policies yourself.
 The **A2AJ local corpus** panel can install the complete case-law and
 legislation datasets for faster local-first lookups. It checks upstream
 partition metadata for staleness, resumes interrupted downloads, and reuses
-byte-identical partitions. If an upstream Parquet file was merely serialized in
-a different row order, the update retains the existing local file after
-verifying that its rows are unchanged. Stable multi-file dataset partitions are
-also supported so upstream publishers can add shards without replacing prior
-ones. The separate **Local only** setting requires that complete corpus and
-prevents verification runs from making network requests; journal retrieval and
-the bundled reference database are already local. Installing or updating the
-corpus is an explicit network operation and currently requires about 4.9 GB of
-storage.
+unchanged partitions. After a download it atomically builds the shared SQLite
+runtime used for every lookup. The separate **Local only** setting requires
+that complete corpus and prevents verification runs from making network
+requests; journal retrieval and the bundled reference database are already
+local. Installing or updating the corpus is an explicit network operation and
+currently requires about 4.9 GB of storage. Source installations need the
+optional importer first:
+
+    python -m pip install -r requirements-a2aj.txt
 
 ## Windows package
 
@@ -94,9 +94,32 @@ notices, and a SHA-256 checksum. The executable is digitally signed.
 ## Test
 
     python -m pip install -r requirements.txt pytest
+    python tools/sync_legalpdf_engine.py check
     python -X utf8 -m pytest tests -q
 
 CI runs the test suite on Windows, macOS, and Linux with Python 3.11.
+
+### Updating the legal-PDF engine
+
+The repository contains the complete runtime used by ALR Quote Verifier, so a
+normal clone, test run, and build never require another repository or a path on
+the maintainer's computer. To promote a committed engine revision, clone or
+open `universal-legal-pdf-engine` anywhere and run:
+
+    python tools/sync_legalpdf_engine.py sync --engine <engine-checkout>
+    python tools/sync_legalpdf_engine.py check --engine <engine-checkout>
+    python -X utf8 -m pytest tests/test_pdf_adapter.py -q
+
+The sync refuses uncommitted engine changes and records the exact commit and
+SHA-256 of every copied runtime file. For a byte-identical performance change,
+compare a clean baseline ALR worktree with the candidate on representative
+PDFs before committing:
+
+    python tools/compare_legalpdf_vendor.py --baseline <old-alr-worktree> --candidate . --pdf <sample.pdf> --repeat 7 --require-faster
+
+Any stable ALR document-contract difference or non-improving median exits with
+an error. Intentional parsing changes require reviewing the reported contract
+difference and updating the relevant regression fixture explicitly.
 
 ## Key contributors
 

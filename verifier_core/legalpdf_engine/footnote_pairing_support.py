@@ -148,6 +148,7 @@ _CHAR_REPLACEMENTS = {
     "\u00a0": " ",
     "\ufeff": "",
 }
+_DIGIT_RUN_RE = re.compile(r"\d+")
 
 
 def _reporter_abbreviation_regex(abbreviation: str) -> str:
@@ -210,9 +211,11 @@ def _has_citation_signal(text: str) -> bool:
     normalized = unicodedata.normalize("NFKC", text or "")
     for source, target in _CHAR_REPLACEMENTS.items():
         normalized = normalized.replace(source, target)
-    return any(pattern.search(normalized) for pattern in _CITATION_SIGNAL_RES) or bool(
-        _mcgill_reporter_citation_re().search(normalized)
-    )
+    if any(pattern.search(normalized) for pattern in _CITATION_SIGNAL_RES):
+        return True
+    if len(_DIGIT_RUN_RE.findall(normalized)) < 2:
+        return False
+    return bool(_mcgill_reporter_citation_re().search(normalized))
 
 
 ROMAN_VALUES = {

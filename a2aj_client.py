@@ -15,9 +15,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from local_a2aj import LocalA2AJCorpus
+from verifier_core.paths import legal_provider_dir
 
 A2AJ_BASE_URL = "https://api.a2aj.ca"
-A2AJ_CACHE_DIR = os.path.join("cache", "a2aj")
+A2AJ_CACHE_DIR = str(legal_provider_dir("a2aj") / "http-cache")
 A2AJ_REPORTER_ALIASES_PATH = os.path.join(os.path.dirname(__file__), "data", "a2aj_reporter_aliases.json")
 A2AJ_MIN_SECONDS_BETWEEN_REQUESTS = 1.0
 A2AJ_REQUEST_TIMEOUT_SECONDS = 30

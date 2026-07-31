@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -46,6 +47,33 @@ class CopyingCorpus(LocalA2AJCorpus):
         self.downloaded.append(item.path)
 
 
+def test_legacy_corpus_is_moved_only_after_explicit_adoption(tmp_path):
+    legacy = tmp_path / "legacy"
+    for kind, dataset in (("cases", "SCC"), ("laws", "LEGISLATION-FED")):
+        relative = f"{dataset}/train.parquet"
+        source = legacy / kind / relative
+        source.parent.mkdir(parents=True)
+        source.write_bytes(kind.encode("ascii"))
+        item = {
+            "path": relative,
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "size": source.stat().st_size,
+        }
+        (legacy / kind / "manifest.json").write_text(
+            json.dumps({"revision": "legacy", "files": [item]}),
+            encoding="utf-8",
+        )
+
+    target = tmp_path / "shared" / "source"
+    corpus = LocalA2AJCorpus(target, legacy_root=legacy)
+    assert corpus.legacy_source_ready()
+    assert not target.exists()
+    assert corpus.adopt_legacy_source()
+    assert (target / "cases" / "SCC" / "train.parquet").read_bytes() == b"cases"
+    assert not legacy.exists()
+    assert not corpus.adopt_legacy_source()
+
+
 def test_incremental_atomic_update_and_exact_lookup(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -61,9 +89,9 @@ def test_incremental_atomic_update_and_exact_lookup(tmp_path):
     initial = RemoteSnapshot("cases", "a2aj/test", "rev-1", "2026-01-01", (first_file, second_file))
 
     assert corpus.install_or_update("cases", remote=initial).installed_revision == "rev-1"
+    assert corpus.runtime_ready()
     result = corpus.fetch("2024 SCC 1", "cases")
     assert result["json"]["results"][0]["unofficial_text_en"] == "first text"
-    assert result["json"]["results"][0]["scraped_timestamp_en"] == "2024-01-01T12:00:00"
     json.dumps(result)  # DuckDB dates and other scalar types are normalized.
     assert corpus.search_exact_name("second case", "cases")["json"]["results"][0]["citation_en"] == "2024 SCC 2"
     assert corpus.coverage("cases") == {"FIRST.PARQUET", "SECOND.PARQUET"}
@@ -81,79 +109,11 @@ def test_incremental_atomic_update_and_exact_lookup(tmp_path):
     with pytest.raises(InstallCancelled):
         corpus.install_or_update("cases", remote=future, cancelled=lambda: True)
     assert corpus.status("cases").installed_revision == "rev-2"
+    assert corpus.fetch("2024 SCC 2", "cases")["json"]["results"][0][
+        "unofficial_text_en"
+    ] == "new text"
     (corpus.root / "cases" / second_file.path).unlink()
     assert corpus.status("cases").installed is False
-
-
-def test_row_reordering_does_not_replace_an_existing_partition(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir()
-    original = source / "original.parquet"
-    reordered = source / "reordered.parquet"
-    rows = (
-        ("2024 SCC 1", "First Case", "first text"),
-        ("2024 SCC 2", "Second Case", "second text"),
-    )
-    with duckdb.connect() as connection:
-        connection.execute(
-            "CREATE TABLE rows(dataset VARCHAR, citation_en VARCHAR, "
-            "name_en VARCHAR, unofficial_text_en VARCHAR)"
-        )
-        connection.executemany(
-            "INSERT INTO rows VALUES ('SCC', ?, ?, ?)", rows
-        )
-        connection.table("rows").write_parquet(str(original))
-        connection.execute("DELETE FROM rows")
-        connection.executemany(
-            "INSERT INTO rows VALUES ('SCC', ?, ?, ?)", reversed(rows)
-        )
-        connection.table("rows").write_parquet(str(reordered))
-
-    def corpus_file(path):
-        content = path.read_bytes()
-        return CorpusFile(
-            "SCC/train.parquet", hashlib.sha256(content).hexdigest(), len(content)
-        )
-
-    original_file = corpus_file(original)
-    reordered_file = corpus_file(reordered)
-    assert original_file.sha256 != reordered_file.sha256
-    corpus = CopyingCorpus(
-        tmp_path / "corpus",
-        {
-            original_file.sha256: original,
-            reordered_file.sha256: reordered,
-        },
-    )
-    initial = RemoteSnapshot(
-        "cases", "a2aj/test", "rev-1", "2026-01-01", (original_file,)
-    )
-    update = RemoteSnapshot(
-        "cases", "a2aj/test", "rev-2", "2026-01-08", (reordered_file,)
-    )
-
-    corpus.install_or_update("cases", remote=initial)
-    installed = corpus.root / "cases" / original_file.path
-    original_bytes = installed.read_bytes()
-    manifest_path = corpus.root / "cases" / "manifest.json"
-    legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    legacy_manifest["version"] = 1
-    legacy_manifest.pop("local_files")
-    manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
-    corpus.downloaded.clear()
-    status = corpus.install_or_update("cases", remote=update)
-
-    assert corpus.downloaded == [original_file.path]
-    assert installed.read_bytes() == original_bytes
-    assert status.installed is True
-    assert status.stale is False
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["files"][0]["sha256"] == reordered_file.sha256
-    assert manifest["local_files"][0]["sha256"] == original_file.sha256
-
-    corpus.downloaded.clear()
-    corpus.install_or_update("cases", remote=update)
-    assert corpus.downloaded == []
 
 
 def test_exact_lookup_survives_unwritable_query_cache(tmp_path):
@@ -171,29 +131,6 @@ def test_exact_lookup_survives_unwritable_query_cache(tmp_path):
         result = corpus.fetch("2024 SCC 1", "cases")
 
     assert result["json"]["results"][0]["unofficial_text_en"] == "first text"
-
-
-def test_unchanged_inventory_migrates_stale_lookup_index(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir()
-    parquet = source / "case.parquet"
-    item = _parquet(parquet, "2024 SCC 1", "First Case", "first text")
-    corpus = CopyingCorpus(tmp_path / "corpus", {item.sha256: parquet})
-    remote = RemoteSnapshot("cases", "a2aj/test", "rev-1", "2026-01-01", (item,))
-    corpus.install_or_update("cases", remote=remote)
-    index = corpus.root / "cases" / "lookup.duckdb"
-    with duckdb.connect(str(index)) as connection:
-        connection.execute("UPDATE metadata SET value = '4' WHERE key = 'schema'")
-
-    with mock.patch.object(
-        corpus, "_build_lookup_index", wraps=corpus._build_lookup_index
-    ) as rebuild:
-        corpus.install_or_update("cases", remote=remote)
-
-    rebuild.assert_called_once()
-    with duckdb.connect(str(index), read_only=True) as connection:
-        metadata = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
-    assert metadata["schema"] == "5"
 
 
 def test_exact_index_accepts_live_citation_surface_variants_without_numeric_collisions(tmp_path):
@@ -286,35 +223,6 @@ def test_hugging_face_metadata_shape(tmp_path):
     assert remote.files == (CorpusFile("SCC/train.parquet", "a" * 64, 7),)
 
 
-def test_neutral_citation_reads_only_its_dataset_partition(tmp_path):
-    paths = [
-        tmp_path / "BCCA" / "train.parquet",
-        tmp_path / "FC" / "2025.parquet",
-        tmp_path / "FC" / "2026.parquet",
-    ]
-    assert LocalA2AJCorpus._paths_for_query(
-        "cases", paths, "Example v Canada, 2022 FC 960"
-    ) == paths[1:]
-    assert LocalA2AJCorpus._paths_for_query(
-        "cases", paths, "Example v Canada, [2022] 1 SCR 1"
-    ) == paths
-    law_paths = [
-        tmp_path / "LEGISLATION-FED" / "train.parquet",
-        tmp_path / "LEGISLATION-ON" / "pre-2000.parquet",
-        tmp_path / "LEGISLATION-ON" / "2000-present.parquet",
-        tmp_path / "REGULATIONS-ON" / "train.parquet",
-    ]
-    assert LocalA2AJCorpus._paths_for_query(
-        "laws", law_paths, "Employment Standards Act, 2000, SO 2000, c 41"
-    ) == law_paths[1:3]
-    assert LocalA2AJCorpus._paths_for_query(
-        "laws", law_paths, "O Reg 285/01"
-    ) == [law_paths[3]]
-    assert LocalA2AJCorpus._paths_for_query(
-        "laws", law_paths, "RSC 1985, c X-1"
-    ) == [law_paths[0]]
-
-
 def test_client_prefers_local_corpus_and_local_only_fails_closed(tmp_path, monkeypatch):
     class Corpus:
         def fetch(self, citation, doc_type, **kwargs):
@@ -361,18 +269,63 @@ def test_local_only_never_reports_a_network_error_for_local_failure(
     assert client.lookup("2024 SCC 1", "cases").status == "not_found"
 
 
-def test_exact_lookup_uses_json_cache_before_duckdb_or_index(tmp_path):
-    corpus = LocalA2AJCorpus(tmp_path)
-    cache_path = corpus._query_cache_path(
-        "cases", "citation", _citation_lookup_key("2024 SCC 1")
+def _runtime_database(path, *, metadata_only=False):
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE document(
+            id INTEGER PRIMARY KEY, doc_type TEXT, dataset TEXT,
+            citation_en TEXT, citation_fr TEXT, citation2_en TEXT, citation2_fr TEXT,
+            name_en TEXT, name_fr TEXT, document_date_en TEXT, document_date_fr TEXT,
+            url_en TEXT, url_fr TEXT, unofficial_text_en TEXT, unofficial_text_fr TEXT,
+            unofficial_sections_en TEXT, unofficial_sections_fr TEXT,
+            upstream_license TEXT
+        );
+        CREATE TABLE citation_lookup(
+            citation_key TEXT, document_id INTEGER,
+            PRIMARY KEY(citation_key, document_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE name_lookup(
+            name_key TEXT, document_id INTEGER,
+            PRIMARY KEY(name_key, document_id)
+        ) WITHOUT ROWID;
+    """)
+    connection.execute(
+        "INSERT INTO meta VALUES ('metadata_only', ?)",
+        ("true" if metadata_only else "false",),
     )
-    cache_path.parent.mkdir(parents=True)
-    expected = [{"citation_en": "2024 SCC 1", "unofficial_text_en": "cached"}]
-    cache_path.write_text(json.dumps(expected), encoding="utf-8")
+    connection.execute("INSERT INTO meta VALUES ('schema_version', '3')")
+    connection.execute(
+        "INSERT INTO document VALUES "
+        "(1,'cases','SCC','2024 SCC 1',NULL,NULL,NULL,'Example v Test',NULL,NULL,NULL,"
+        "'https://example.test/case',NULL,?,NULL,NULL,NULL,NULL)",
+        (None if metadata_only else "full decision text",),
+    )
+    connection.execute("INSERT INTO citation_lookup VALUES ('2024scc1',1)")
+    connection.execute("INSERT INTO name_lookup VALUES ('example v test',1)")
+    connection.commit()
+    connection.close()
 
-    with mock.patch.object(
-        corpus, "_ensure_lookup_index", side_effect=AssertionError("index was opened")
-    ), mock.patch("builtins.__import__", wraps=__import__) as imported:
-        assert corpus.fetch("2024 SCC 1", "cases")["json"]["results"] == expected
 
+def test_full_text_sqlite_runtime_does_not_import_duckdb(tmp_path):
+    database = tmp_path / "a2aj.sqlite"
+    _runtime_database(database)
+    corpus = LocalA2AJCorpus(tmp_path / "missing-parquet", runtime_db=database)
+
+    with mock.patch("builtins.__import__", wraps=__import__) as imported:
+        citation = corpus.fetch("2024 SCC 1", "cases")["json"]["results"][0]
+        named = corpus.search_exact_name("Example v. Test", "cases")["json"]["results"][0]
+
+    assert citation["unofficial_text_en"] == "full decision text"
+    assert citation["source_url_en"] == "https://example.test/case"
+    assert named["citation_en"] == "2024 SCC 1"
     assert not any(call.args and call.args[0] == "duckdb" for call in imported.mock_calls)
+
+
+def test_metadata_only_sqlite_is_not_treated_as_source_text(tmp_path):
+    database = tmp_path / "a2aj.sqlite"
+    _runtime_database(database, metadata_only=True)
+    corpus = LocalA2AJCorpus(tmp_path / "missing-parquet", runtime_db=database)
+
+    with pytest.raises(RuntimeError, match="not installed"):
+        corpus.fetch("2024 SCC 1", "cases")

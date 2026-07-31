@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA_VERSION = "legalpdf.document.v2"
+GEOMETRY_SCHEMA_VERSION = "legalpdf.geometry.v1"
 PARSER_VERSION = "0.3.0"
 
 
@@ -219,8 +222,19 @@ class FootnoteLookup:
     context: str = ""
 
 
+def _json_default(value: Any) -> dict[str, Any]:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {item.name: getattr(value, item.name) for item in fields(value)}
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _json_line(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+    return json.dumps(
+        value,
+        default=_json_default,
+        ensure_ascii=False,
+        sort_keys=True,
+    ) + "\n"
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -239,32 +253,177 @@ def _atomic_write(path: Path, text: str) -> None:
             pass
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _write_jsonl(path: Path, values: Iterable[Any]) -> None:
-    _atomic_write(path, "".join(_json_line(asdict(value)) for value in values))
+    _atomic_write(path, "".join(_json_line(value) for value in values))
 
 
-def write_artifacts(document: LegalDocument, output_dir: str | Path) -> Path:
+def _write_jsonl_gzip(path: Path, values: Iterable[Any]) -> str:
+    raw = "".join(_json_line(value) for value in values).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=1, mtime=0)
+    _atomic_write_bytes(path, compressed)
+    return hashlib.sha256(compressed).hexdigest()
+
+
+def _compact_page(page: Page) -> dict[str, Any]:
+    return {
+        "id": page.id,
+        "index": page.index,
+        "number": page.number,
+        "printed_label": page.printed_label,
+        "printed_label_source": page.printed_label_source,
+        "source": page.source,
+        "text_quality": page.text_quality,
+        "lines": [
+            {"reading_order": line.reading_order, "text": line.text}
+            for line in page.lines
+        ],
+    }
+
+
+def write_artifacts(
+    document: LegalDocument,
+    output_dir: str | Path,
+    *,
+    compact_pages: bool = False,
+) -> Path:
     """Write collections first and publish ``document.json`` last."""
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "document.json"
     manifest_path.unlink(missing_ok=True)
-    _write_jsonl(root / "pages.jsonl", document.pages)
+    _write_jsonl(
+        root / "pages.jsonl",
+        (_compact_page(page) for page in document.pages)
+        if compact_pages
+        else document.pages,
+    )
     _write_jsonl(root / "paragraphs.jsonl", document.paragraphs)
     _write_jsonl(root / "sections.jsonl", document.sections)
     _write_jsonl(root / "footnotes.jsonl", document.footnotes)
     _write_jsonl(root / "diagnostics.jsonl", document.diagnostics)
     _write_jsonl(root / "repairs.jsonl", document.repairs)
+    manifest = document.to_manifest()
+    if compact_pages:
+        manifest["artifact_profile"] = "compact-source"
     _atomic_write(
         manifest_path,
-        json.dumps(document.to_manifest(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
     return manifest_path
 
 
+def write_geometry_artifacts(
+    pages: Iterable[Page],
+    output_dir: str | Path,
+    *,
+    source_sha256: str,
+    engine_code: str,
+    deterministic_cache_key: str,
+) -> Path:
+    """Publish geometry pages without duplicating derived evidence artifacts."""
+
+    root = Path(output_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "geometry.json"
+    manifest_path.unlink(missing_ok=True)
+    materialized = list(pages)
+    pages_sha256 = _write_jsonl_gzip(
+        root / "pages.jsonl.gz",
+        materialized,
+    )
+    _atomic_write(
+        manifest_path,
+        json.dumps(
+            {
+                "schema_version": GEOMETRY_SCHEMA_VERSION,
+                "parser_version": PARSER_VERSION,
+                "source_sha256": source_sha256,
+                "engine_code": engine_code,
+                "deterministic_cache_key": deterministic_cache_key,
+                "page_count": len(materialized),
+                "pages_sha256": pages_sha256,
+                "artifacts": {"pages": "pages.jsonl.gz"},
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    return manifest_path
+
+
+def load_geometry_artifacts(
+    document: str | Path,
+    geometry: str | Path,
+) -> list[Page]:
+    """Load a verified compressed page sidecar for a compact document."""
+
+    document_manifest, document_paths = _load_artifact_manifest(document)
+    if document_manifest.get("artifact_profile") != "compact-source":
+        raise ValueError("Geometry requires a compact-source artifact")
+    geometry_path = Path(geometry).expanduser().resolve()
+    if geometry_path.is_dir():
+        geometry_path /= "geometry.json"
+    with geometry_path.open(encoding="utf-8") as handle:
+        geometry_manifest = json.load(handle)
+    if (
+        not isinstance(geometry_manifest, dict)
+        or geometry_manifest.get("schema_version") != GEOMETRY_SCHEMA_VERSION
+        or geometry_manifest.get("parser_version") != PARSER_VERSION
+        or geometry_manifest.get("source_sha256")
+        != document_manifest.get("source_sha256")
+        or geometry_manifest.get("engine_code")
+        != document_manifest.get("provenance", {}).get("engine_code")
+        or geometry_manifest.get("deterministic_cache_key")
+        != document_manifest.get("provenance", {}).get("deterministic_cache_key")
+    ):
+        raise ValueError("Geometry sidecar does not match the compact artifact")
+    artifacts = geometry_manifest.get("artifacts")
+    pages_name = artifacts.get("pages") if isinstance(artifacts, dict) else None
+    if not isinstance(pages_name, str) or not pages_name:
+        raise ValueError("Geometry sidecar has no pages artifact")
+    geometry_pages_path = (geometry_path.parent / pages_name).resolve()
+    if not geometry_pages_path.is_relative_to(geometry_path.parent):
+        raise ValueError("Geometry sidecar has an unsafe pages path")
+    if (
+        geometry_manifest.get("pages_sha256")
+        != hashlib.sha256(geometry_pages_path.read_bytes()).hexdigest()
+    ):
+        raise ValueError("Geometry sidecar payload hash does not match")
+    geometry_pages = _read_jsonl(geometry_pages_path)
+    if (
+        geometry_manifest.get("page_count") != len(geometry_pages)
+        or len(_read_jsonl(document_paths["pages"])) != len(geometry_pages)
+    ):
+        raise ValueError("Geometry sidecar page count does not match")
+    return [_page_from_dict(page) for page in geometry_pages]
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
+    handle_context = (
+        gzip.open(path, mode="rt", encoding="utf-8")
+        if path.suffix.casefold() == ".gz"
+        else path.open(encoding="utf-8")
+    )
+    with handle_context as handle:
         rows = []
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():

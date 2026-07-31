@@ -1,4 +1,4 @@
-"""Neutral legal-PDF runtime pinned to upstream commit 51d51c4.
+"""Vendored neutral legal-PDF runtime; see VENDORED.json for provenance.
 
 Only the deterministic parsing modules needed by ALR Quote Verifier are
 included here; model repair, command-line, benchmark, and DOCX tooling remain

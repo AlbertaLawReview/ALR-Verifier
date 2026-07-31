@@ -33,3 +33,29 @@ def data_dir() -> Path:
     else:
         base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(base) / APP_DIR_NAME
+
+
+def legal_data_root() -> Path:
+    """Shared OpenLegalData root used by Beaver and independent products."""
+    configured = os.environ.get("OPEN_LEGAL_DATA_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if sys.platform == "win32":
+        base = Path(
+            os.environ.get("LOCALAPPDATA")
+            or str(Path.home() / "AppData" / "Local")
+        )
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(
+            os.environ.get("XDG_DATA_HOME")
+            or str(Path.home() / ".local" / "share")
+        )
+    return (base / "OpenLegalProducts" / "LegalData").resolve()
+
+
+def legal_provider_dir(provider: str) -> Path:
+    if not provider or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for ch in provider):
+        raise ValueError("provider must be a lowercase filesystem-safe name")
+    return legal_data_root() / "providers" / provider

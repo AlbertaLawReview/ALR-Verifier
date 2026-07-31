@@ -37,13 +37,14 @@ def test_dotted_reporter_lookup_deduplicates_one_physical_corpus_row(tmp_path):
         ),
         encoding="utf-8",
     )
-    corpus._build_lookup_index(active, [item], "test-revision")
+    corpus.build_runtime_database()
 
     rows = corpus.fetch("[1988] 2 S.C.R. 833", "cases")["json"]["results"]
     assert len(rows) == 1
     assert rows[0]["name_en"] == "R. v. Bernard"
 
     lookup = a2aj_client.A2AJClient(
+        cache_dir=str(tmp_path / "cache"),
         local_corpus=corpus,
         local_only=True,
         reporter_aliases_path="",

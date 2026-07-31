@@ -2210,7 +2210,8 @@ class ALRQuoteVerifierGUI:
         return corpus.status("cases"), corpus.status("laws")
 
     def _a2aj_corpus_installed(self) -> bool:
-        return all(status.installed for status in self._a2aj_statuses())
+        corpus = aqv.a2aj_client.get_local_corpus()
+        return all(status.installed for status in self._a2aj_statuses()) and corpus.runtime_ready()
 
     @staticmethod
     def _format_gb(size: int) -> str:
@@ -2218,7 +2219,7 @@ class ALRQuoteVerifierGUI:
 
     def _refresh_a2aj_corpus_ui(self, remote_statuses=None, message=""):
         statuses = self._a2aj_statuses()
-        installed = all(status.installed for status in statuses)
+        installed = self._a2aj_corpus_installed()
         size = sum(status.size for status in statuses)
         if message:
             label = message
@@ -2288,6 +2289,7 @@ class ALRQuoteVerifierGUI:
 
     def _offer_local_corpus_install(self) -> bool:
         result = {"install": False}
+        reuse_existing = aqv.a2aj_client.get_local_corpus().legacy_source_ready()
         dlg = tk.Toplevel(self.root)
         dlg.withdraw()
         dlg.title("Install the A2AJ local corpus?")
@@ -2303,9 +2305,13 @@ class ALRQuoteVerifierGUI:
         ).pack(anchor=tk.W)
         ttk.Label(
             frame,
-            text="Install downloads about 4.9 GB of case law and legislation. "
-                 "The documents are unofficial and retain their upstream terms. "
-                 "Interrupted downloads can be resumed.",
+            text=(
+                "Use existing moves the previously downloaded corpus into shared "
+                "storage, checks for updates, and prepares local lookup."
+                if reuse_existing else
+                "Install downloads about 4.9 GB of case law and legislation. "
+                "Interrupted downloads can be resumed."
+            ),
             style="CardMuted.TLabel", wraplength=430, justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(8, 0))
 
@@ -2320,7 +2326,8 @@ class ALRQuoteVerifierGUI:
             command=dlg.destroy,
         ).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(
-            buttons, text="Install", style="Primary.TButton", command=install,
+            buttons, text="Use existing" if reuse_existing else "Install",
+            style="Primary.TButton", command=install,
         ).pack(side=tk.RIGHT)
         self._center_over_root(dlg)
         dlg.deiconify()
@@ -2375,6 +2382,12 @@ class ALRQuoteVerifierGUI:
         def worker():
             try:
                 corpus = aqv.a2aj_client.get_local_corpus()
+                if corpus.legacy_source_ready():
+                    self.root.after(
+                        0, self.a2aj_corpus_status_var.set,
+                        "Moving existing A2AJ corpus to shared storageâ€¦",
+                    )
+                    corpus.adopt_legacy_source()
                 snapshots = (
                     corpus.fetch_metadata("cases"),
                     corpus.fetch_metadata("laws"),
@@ -2390,9 +2403,16 @@ class ALRQuoteVerifierGUI:
                     corpus.install_or_update(
                         snapshot.kind, remote=snapshot, progress=progress,
                         cancelled=self._a2aj_cancel.is_set,
+                        rebuild_runtime=False,
                     )
                     aqv.a2aj_client.clear_memory_cache()
                     offset += snapshot.size
+                self.root.after(
+                    0, self.a2aj_corpus_status_var.set,
+                    "Preparing shared SQLite corpusâ€¦",
+                )
+                corpus.build_runtime_database(cancelled=self._a2aj_cancel.is_set)
+                aqv.a2aj_client.clear_memory_cache()
                 self.root.after(0, self._finish_a2aj_install, True, "")
             except InstallCancelled:
                 self.root.after(
@@ -3378,10 +3398,6 @@ if __name__ == "__main__":
     if _run_cli_smoke_from_env():
         raise SystemExit(0)
     _startup_probe = os.environ.get("ALR_STARTUP_PROBE")
-    if _startup_probe:
-        import duckdb
-        with duckdb.connect() as _probe_db:
-            _probe_db.execute("SELECT TIMESTAMPTZ '2024-01-01 00:00:00+00'").fetchone()
     app = ALRQuoteVerifierGUI()
     if _startup_probe == "layout":
         app.notebook.select(app.settings_tab)

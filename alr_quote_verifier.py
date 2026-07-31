@@ -2754,6 +2754,10 @@ class FootnotePart:
     author_provided_link: str = ""
     author_provided_links: List[str] = field(default_factory=list)
     pre_provider_link: Optional[str] = None
+    # Deterministic source identity for later history/reference resolution.
+    # Neither this nor the coarse witness bit gives the model a pinpoint.
+    authority_id: str = ""
+    source_evidence_found: bool = False
 
 
 _SCR_REPORTED_CITATION_RE = re.compile(
@@ -2798,16 +2802,89 @@ def _extract_page_like_pinpoint(text: str) -> Optional[int]:
 def _build_footnote_history_entries(parts: List["FootnotePart"]) -> str:
     entries = []
     for part in parts:
+        raw_link = (
+            part.pre_provider_link
+            if part.pre_provider_link is not None
+            else (part.link or "")
+        )
+        # Pinpoints are deterministic output.  In particular, an A2AJ quote
+        # found at a different paragraph must not invite the next model call
+        # to reinterpret or rewrite paragraph numbers.
+        link_base, _fragment = _split_url(raw_link)
         entries.append(
             "- Citation: " + (part.verbatim or "")
-            + " --> Link: " + (
-                part.pre_provider_link
-                if part.pre_provider_link is not None
-                else (part.link or "")
-            )
+            + " --> Link: " + link_base
             + " --> short_form: " + ((part.short_form or "").strip() or "N/A") + "\n"
+            + (
+                "  --> source_evidence_found: true\n"
+                if part.source_evidence_found else ""
+            )
         )
     return "".join(entries)
+
+
+def _interleave_a2aj_evidence(
+    parts: List["FootnotePart"], proposition_text: str,
+) -> List["FootnotePart"]:
+    """Attach only positive, pinpoint-free A2AJ evidence for later history.
+
+    The full verifier still owns quote status and locator recovery.  This
+    narrow pass exists so later sequential footnotes can benefit from an
+    already-proven source association without learning whether the quote was
+    found at the cited paragraph, another paragraph, or only as an accepted
+    partial overlap.  Misses are represented by no field at all.
+    """
+    if not USE_A2AJ:
+        return parts
+
+    quotes = [
+        (quote.get("inner") or quote.get("raw") or "").strip()
+        for quote in find_inline_quotes(proposition_text or "")
+        if (quote.get("inner") or quote.get("raw") or "").strip()
+    ]
+    enriched: List[FootnotePart] = []
+    for part in parts:
+        if (part.kind or "").strip().lower() not in {
+            "case", "unreported", "statute", "gazette",
+        }:
+            enriched.append(part)
+            continue
+        query = _a2aj_query_citation(
+            part.bare_citation or part.citation_with_style or part.verbatim
+        )
+        if not query:
+            enriched.append(part)
+            continue
+        try:
+            lookup = a2aj_client.lookup_document(query, part.kind)
+        except Exception:
+            enriched.append(part)
+            continue
+        document = lookup.document if lookup.status == "found" else None
+        if not document:
+            enriched.append(part)
+            continue
+        identity = "\0".join(
+            (document.dataset, document.citation, document.alternate_citation)
+        )
+        authority_id = "a2aj:" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()[:20]
+        source_text = _normalized_a2aj_document_text(
+            document,
+            "law" if part.kind in {"statute", "gazette"} else "case",
+        )
+        witnessed = bool(
+            quotes
+            and source_text
+            and any(_quote_match_score(quote, source_text) >= 0.6 for quote in quotes)
+        )
+        enriched.append(replace(
+            part,
+            authority_id=authority_id,
+            source_evidence_found=witnessed,
+        ))
+    return enriched
 
 
 # Serializes HTML/URL resolution when footnotes are split in parallel: a
@@ -5556,90 +5633,6 @@ def _drop_unresolved_supra_links(
     return methods
 
 
-def _prefetch_local_a2aj_sources(
-    footnote_map: Dict[int, str], footnote_order: List[int]
-) -> None:
-    """Warm exact local-A2AJ lookups with one Parquet scan per partition."""
-    if not (USE_A2AJ and DETERMINISTIC_SOURCE_SPLITTER):
-        return
-    client = a2aj_client.get_client()
-    corpus = client.local_corpus
-    if corpus is None:
-        return
-
-    candidates: Dict[str, List[str]] = {"cases": [], "laws": []}
-    for fid in footnote_order:
-        split = _deterministic_splitter.split_footnote_recall_first(
-            footnote_map.get(fid, "")
-        )
-        if split.status != "deterministic_complete":
-            continue
-        for source in split.parts:
-            item = _deterministic_splitter.extract_fields(source)
-            kind = item.kind.strip().lower()
-            styled = item.citation_with_style or source.text
-            bare = (
-                _derive_bare_citation(styled, kind)
-                or item.bare_citation
-                or source.text
-            )
-            raw_bare = re.sub(r"\s+", " ", str(bare or "")).strip()
-            if not raw_bare:
-                continue
-            if kind in {"case", "unreported"}:
-                direct = _a2aj_query_citation(raw_bare)
-                identity = _a2aj_identity_citation(raw_bare)
-                alias = client.reporter_alias_canonical(raw_bare)
-                candidates["cases"].extend(
-                    value for value in (direct, identity, alias) if value
-                )
-            elif kind in {"statute", "gazette"}:
-                bare_query = _a2aj_query_citation(raw_bare)
-                query = raw_bare.rstrip(".;") if re.search(
-                    r",\s*(?:r(?:ule)?s?\.?)\s*\d+(?:\.\d+)*\s*$",
-                    raw_bare,
-                    flags=re.I,
-                ) else bare_query
-                candidates["laws"].extend(
-                    value for value in (query, bare_query) if value
-                )
-
-    totals = {"requested": 0, "cached": 0, "partitions": 0, "rows": 0}
-
-    def show_progress(update: Any) -> None:
-        _pause_gate()
-        label = "cases" if update.kind == "cases" else "legislation"
-        _ts_print(
-            f"    Loading local A2AJ {label}: partition "
-            f"{update.completed}/{update.total} ..."
-        )
-
-    started = time.perf_counter()
-    for doc_type in ("cases", "laws"):
-        if not candidates[doc_type]:
-            continue
-        try:
-            stats = corpus.prefetch_exact_citations(
-                candidates[doc_type], doc_type, progress=show_progress
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            if client.local_only:
-                _ts_print(
-                    f"    Local A2AJ {doc_type} prefetch unavailable "
-                    f"({type(exc).__name__}); continuing with ordinary lookup."
-                )
-            continue
-        for name in totals:
-            totals[name] += int(stats.get(name, 0))
-    if totals["requested"]:
-        _ts_print(
-            "    Local A2AJ ready: "
-            f"{totals['requested']} exact lookup(s), "
-            f"{totals['rows']} row(s) from {totals['partitions']} new partition scan(s) "
-            f"in {time.perf_counter() - started:.1f}s."
-        )
-
-
 def build_footnote_parts(
     footnote_map: Dict[int, str],
     footnote_order: List[int],
@@ -5654,8 +5647,6 @@ def build_footnote_parts(
     total_fns = len(footnote_order)
     analyzer = "deterministically (no LLM)" if FREE_NO_LLM else "with GPT"
     _ts_print(f"  Analyzing {total_fns} footnotes {analyzer} ...")
-    _prefetch_local_a2aj_sources(footnote_map, footnote_order)
-
     # Phase 1: split every footnote sequentially, each call seeing the
     # accumulated citation history of everything before it.
     split_by_fid: Dict[int, List[FootnotePart]] = {}
@@ -5673,6 +5664,7 @@ def build_footnote_parts(
                 "link": part.link,
                 "short_form": part.short_form,
                 "note": note,
+                "authority_id": part.authority_id,
             })
             if (
                 SUPRA_LINKING_AGGRESSIVENESS == "aggressive"
@@ -5710,6 +5702,9 @@ def build_footnote_parts(
                     allow_fallback=False,
                     inferred_short_forms=history_inferred_short_forms,
                 )
+            pre_parts = _interleave_a2aj_evidence(
+                pre_parts, (prop_texts or {}).get(fid, "")
+            )
             doc_history += _build_footnote_history_entries(pre_parts)
             split_by_fid[fid] = pre_parts
             prev_split = pre_parts
@@ -5741,6 +5736,9 @@ def build_footnote_parts(
                     allow_fallback=False,
                     inferred_short_forms=history_inferred_short_forms,
                 )
+            split = _interleave_a2aj_evidence(
+                split, (prop_texts or {}).get(fid, "")
+            )
             doc_history += _build_footnote_history_entries(split)
             split_by_fid[fid] = split
             prev_split = split
@@ -5766,8 +5764,10 @@ def build_footnote_parts(
             split = _apply_author_provided_links(
                 full, split, (author_links_by_fid or {}).get(fid)
             )
-            if any(part.author_provided_link for part in split):
-                new_entries = _build_footnote_history_entries(split)
+            split = _interleave_a2aj_evidence(
+                split, (prop_texts or {}).get(fid, "")
+            )
+            new_entries = _build_footnote_history_entries(split)
             _timing_event(
                 "build_footnote:split",
                 footnote_id=fid,
@@ -5813,6 +5813,7 @@ def build_footnote_parts(
                     "link": part.link,
                     "short_form": part.short_form,
                     "note": note,
+                    "authority_id": part.authority_id,
                 })
                 if (
                     SUPRA_LINKING_AGGRESSIVENESS == "aggressive"
@@ -5934,6 +5935,8 @@ def build_footnote_parts(
                 "pinpoint_fragments": list(effective_pinpoint_fragments),
                 "page_pinpoints": list(effective_page_pinpoints),
                 "_ref_link_resolution": ref_link_methods.get((fid, idx), ""),
+                "_authority_id": part.authority_id,
+                "_source_evidence_found": part.source_evidence_found,
             }
             row.update({
                 key: value for key, value in a2aj_probe.items()

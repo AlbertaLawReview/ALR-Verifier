@@ -25,9 +25,12 @@ from .model import (
     Section,
     Span,
     Word,
+    _compact_page,
     _load_artifact_manifest,
+    _read_jsonl,
     load_artifacts,
     write_artifacts,
+    write_geometry_artifacts,
 )
 from .column_order_arbiter import (
     MAX_CHALLENGER_SWITCHES,
@@ -137,6 +140,7 @@ def _cache_key(
             "parser_version": PARSER_VERSION,
             "engine_code": engine_identity,
             "ocr_provider": getattr(ocr_provider, "name", None),
+            "ocr_provider_identity": getattr(ocr_provider, "identity", None),
         }
     )
 
@@ -2274,12 +2278,11 @@ def _validate_document(document: LegalDocument) -> None:
             raise ValueError(f"Section {section.id} has invalid boundaries.")
 
 
-def _parse_local(
+def _extract_pdf_pages(
     path: Path,
     *,
-    source_hash: str,
     ocr_provider: OCRProvider | None,
-) -> LegalDocument:
+) -> tuple[list[Page], list[Diagnostic], dict[str, Any]]:
     try:
         import fitz
     except ImportError as exc:
@@ -2393,6 +2396,21 @@ def _parse_local(
         diagnostics.extend(_order_page(page))
         _build_regions(page)
     diagnostics.extend(_assign_printed_page_labels(pages))
+    return pages, diagnostics, metadata
+
+
+def _parse_local(
+    path: Path,
+    *,
+    source_hash: str,
+    ocr_provider: OCRProvider | None,
+) -> LegalDocument:
+    import fitz
+
+    pages, diagnostics, metadata = _extract_pdf_pages(
+        path,
+        ocr_provider=ocr_provider,
+    )
     paragraphs, footnotes, pair_diagnostics, pairing_summary = _derive(pages)
     sections = _build_sections(paragraphs)
     diagnostics.extend(pair_diagnostics)
@@ -2508,6 +2526,69 @@ def parse_pdf(
             cache_dir=repair_cache_root / "codex",
         )
     return document
+
+
+def add_pdf_geometry(
+    path: str | Path,
+    *,
+    document: str | Path,
+    output: str | Path,
+    ocr_provider: OCRProvider | None = None,
+) -> Path:
+    """Add geometry to a matching compact parse without repeating derivation."""
+
+    source = Path(path).expanduser().resolve()
+    if not source.is_file() or source.suffix.casefold() != ".pdf":
+        raise ValueError(f"Input must be a PDF: {source}")
+    manifest_path = Path(document).expanduser().resolve()
+    if manifest_path.is_dir():
+        manifest_path /= "document.json"
+    with manifest_path.open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("artifact_profile") != "compact-source"
+    ):
+        raise ValueError("Geometry can only extend a compact-source artifact")
+    source_hash = _sha256_file(source)
+    if manifest.get("source_sha256") != source_hash:
+        raise ValueError("Compact artifact source hash does not match the PDF")
+    if manifest.get("parser_version") != PARSER_VERSION:
+        raise ValueError("Compact artifact parser version does not match this engine")
+    engine_code = _engine_identity()
+    provenance = manifest.get("provenance")
+    cache_key = _cache_key(
+        source_hash,
+        ocr_provider=ocr_provider,
+        engine_identity=engine_code,
+    )
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("engine_code") != engine_code
+        or provenance.get("deterministic_cache_key") != cache_key
+    ):
+        raise ValueError("Compact artifact parse identity does not match this engine")
+    artifacts = manifest.get("artifacts")
+    pages_name = artifacts.get("pages") if isinstance(artifacts, dict) else None
+    if not isinstance(pages_name, str) or not pages_name:
+        raise ValueError("Compact artifact has no pages artifact")
+    compact_pages_path = (manifest_path.parent / pages_name).resolve()
+    if not compact_pages_path.is_relative_to(manifest_path.parent):
+        raise ValueError("Compact artifact has an unsafe pages path")
+    compact_pages = _read_jsonl(compact_pages_path)
+    pages, _diagnostics, _metadata = _extract_pdf_pages(
+        source,
+        ocr_provider=ocr_provider,
+    )
+    if compact_pages != [_compact_page(page) for page in pages]:
+        raise ValueError("Extracted geometry does not match the compact page text")
+    return write_geometry_artifacts(
+        pages,
+        output,
+        source_sha256=source_hash,
+        engine_code=engine_code,
+        deterministic_cache_key=cache_key,
+    )
 
 
 def rebuild_derived(document: LegalDocument) -> LegalDocument:

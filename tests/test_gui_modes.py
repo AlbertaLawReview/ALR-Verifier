@@ -275,6 +275,7 @@ def test_a2aj_corpus_button_routes_check_and_update_separately():
     stub = SimpleNamespace(
         _a2aj_installing=False,
         _a2aj_statuses=lambda: installed_statuses,
+        _a2aj_corpus_installed=lambda: True,
         local_only_var=SimpleNamespace(get=lambda: False, set=Mock()),
         a2aj_corpus_btn=button,
         a2aj_corpus_status_var=Mock(),

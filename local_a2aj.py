@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import unicodedata
 from dataclasses import asdict, dataclass
@@ -14,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Iterable, Optional
 from urllib.parse import quote
 
-from verifier_core.paths import data_dir
+from verifier_core.paths import data_dir, legal_provider_dir
 
 if TYPE_CHECKING:
     import requests
@@ -26,35 +27,6 @@ REPOSITORIES = {
     "cases": "a2aj/canadian-case-law",
     "laws": "a2aj/canadian-laws",
 }
-_NEUTRAL_CITATION_RE = re.compile(
-    r"\b(?:18|19|20)\d{2}\s+([A-Z][A-Z0-9]{1,15})\s+\d+\b", re.I
-)
-_LAW_DATASET_PATTERNS = (
-    (r"\b(?:SOR|SI|DORS|TR)[/-]\d|\bC\.?R\.?C\.?\b", "REGULATIONS-FED"),
-    (r"\b(?:RSC|SC)\s+\d{4}\b", "LEGISLATION-FED"),
-    (r"\b(?:Alta|AB)\s+Reg\b", "REGULATIONS-AB"),
-    (r"\b(?:RSA|SA)\s+\d{4}\b", "LEGISLATION-AB"),
-    (r"\bBC\s+Reg\b", "REGULATIONS-BC"),
-    (r"\b(?:RSBC|SBC)\s+\d{4}\b", "LEGISLATION-BC"),
-    (r"\bMan\s+Reg\b", "REGULATIONS-MB"),
-    (r"\b(?:RSM|SM)\s+\d{4}\b", "LEGISLATION-MB"),
-    (r"\bNB\s+Reg\b", "REGULATIONS-NB"),
-    (r"\b(?:RSNB|SNB)\s+\d{4}\b", "LEGISLATION-NB"),
-    (r"\bNLR\b", "REGULATIONS-NL"),
-    (r"\b(?:RSNL|SNL)\s+\d{4}\b", "LEGISLATION-NL"),
-    (r"\bNS\s+Reg\b", "REGULATIONS-NS"),
-    (r"\b(?:RSNS|SNS)\s+\d{4}\b", "LEGISLATION-NS"),
-    (r"\b(?:NWT\s+Reg|RRNWT)\b", "REGULATIONS-NT"),
-    (r"\b(?:RSNWT|SNWT)\s+\d{4}\b", "LEGISLATION-NT"),
-    (r"\b(?:O|Ont)\s+Reg\b", "REGULATIONS-ON"),
-    (r"\b(?:RSO|SO)\s+\d{4}\b", "LEGISLATION-ON"),
-    (r"\b(?:Sask\s+Reg|RRS)\b", "REGULATIONS-SK"),
-    (r"\b(?:RSS|SS)\s+\d{4}\b", "LEGISLATION-SK"),
-    (r"\bYOIC\b", "REGULATIONS-YT"),
-    (r"\b(?:RSY|SY)\s+\d{4}\b", "LEGISLATION-YT"),
-)
-
-
 @dataclass(frozen=True)
 class CorpusFile:
     path: str
@@ -107,10 +79,57 @@ CancelCallback = Callable[[], bool]
 class LocalA2AJCorpus:
     """Manage atomic local snapshots and exact local lookups."""
 
-    def __init__(self, root: Optional[Path] = None, session: Optional[requests.Session] = None):
-        self.root = Path(root) if root is not None else data_dir() / "a2aj_corpus"
+    def __init__(
+        self,
+        root: Optional[Path] = None,
+        session: Optional[requests.Session] = None,
+        runtime_db: Optional[Path] = None,
+        legacy_root: Optional[Path] = None,
+    ):
+        provider_root = legal_provider_dir("a2aj")
+        self.root = Path(root) if root is not None else provider_root / "source"
+        self.runtime_db = Path(runtime_db) if runtime_db is not None else (
+            self.root.parent / "a2aj.sqlite"
+            if root is not None
+            else provider_root / "a2aj.sqlite"
+        )
+        self.legacy_root = (
+            Path(legacy_root)
+            if legacy_root is not None
+            else data_dir() / "a2aj_corpus"
+        )
         self._lock = threading.RLock()
         self.session = session
+
+    def legacy_source_ready(self) -> bool:
+        """Whether a complete old-layout corpus can be moved into place."""
+        if self.root.exists() or not self.legacy_root.is_dir():
+            return False
+        for kind in ("cases", "laws"):
+            try:
+                manifest = json.loads(
+                    (self.legacy_root / kind / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                files = tuple(
+                    CorpusFile(**item)
+                    for item in (manifest.get("local_files") or manifest.get("files") or ())
+                )
+            except (OSError, TypeError, ValueError):
+                return False
+            if not files or not self._files_present(self.legacy_root / kind, files):
+                return False
+        return True
+
+    def adopt_legacy_source(self) -> bool:
+        """Atomically move an explicitly accepted legacy corpus; never copy it."""
+        with self._lock:
+            if not self.legacy_source_ready():
+                return False
+            self.root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(self.legacy_root, self.root)
+            return True
 
     def _get_session(self) -> requests.Session:
         with self._lock:
@@ -182,6 +201,7 @@ class LocalA2AJCorpus:
         progress: Optional[ProgressCallback] = None,
         cancelled: Optional[CancelCallback] = None,
         remote: Optional[RemoteSnapshot] = None,
+        rebuild_runtime: bool = True,
     ) -> CorpusStatus:
         """Install/update one repository without exposing a partial snapshot."""
         kind = _kind(kind)
@@ -212,8 +232,9 @@ class LocalA2AJCorpus:
             and old_inventory == remote_inventory
             and self._files_present(active, installed_old_files)
         ):
-            _progress(progress, kind, "index", remote.size, remote.size, "Preparing fast local lookup")
-            self._ensure_lookup_index(kind)
+            if rebuild_runtime and not self._runtime_database_ready():
+                _progress(progress, kind, "index", remote.size, remote.size, "Preparing SQLite corpus")
+                self.build_runtime_database()
             return self.status(kind, remote)
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -249,25 +270,12 @@ class LocalA2AJCorpus:
                     self._download_file(
                         remote, item, destination, completed, total, progress, cancelled
                     )
-                if (
-                    prior_local
-                    and source.is_file()
-                    and source.stat().st_size == prior_local.get("size")
-                    and self._parquet_equivalent(source, destination)
-                ):
-                    destination.unlink()
-                    self._link_or_copy(source, destination)
-                    local_files.append(prior_local)
-                    phase = "reuse"
-                else:
-                    local_files.append(asdict(item))
-                    phase = "download"
+                local_files.append(asdict(item))
+                phase = "download"
                 completed += item.size
                 _progress(progress, kind, phase, completed, total, item.path)
 
             self._check_cancel(cancelled)
-            _progress(progress, kind, "index", total, total, "Preparing fast local lookup")
-            self._build_lookup_index(staging, remote.files, remote.revision)
             manifest = {
                 "version": 2,
                 "kind": kind,
@@ -295,6 +303,9 @@ class LocalA2AJCorpus:
                 for obsolete in self.root.glob(f".{kind}-*.staging"):
                     if obsolete.is_dir() and not obsolete.is_symlink():
                         shutil.rmtree(obsolete)
+            if rebuild_runtime:
+                _progress(progress, kind, "index", total, total, "Preparing SQLite corpus")
+                self.build_runtime_database()
             _progress(progress, kind, "complete", total, total, remote.revision)
             return self.status(kind, remote)
         except BaseException:
@@ -374,389 +385,269 @@ class LocalA2AJCorpus:
         rows = self._exact_rows(doc_type, name=name)
         return {"http_status": 200, "json": {"results": rows}, "text": None, "local": True}
 
-    def prefetch_exact_citations(
-        self,
-        citations: Iterable[str],
-        doc_type: str,
-        *,
-        progress: Optional[ProgressCallback] = None,
-    ) -> dict[str, int]:
-        """Fill exact-citation caches with one scan per Parquet partition."""
-        return self._prefetch_exact(
-            citations, doc_type, lookup_type="citation", progress=progress
-        )
-
-    def prefetch_exact_names(
-        self,
-        names: Iterable[str],
-        doc_type: str,
-        *,
-        citations: Iterable[str] = (),
-        progress: Optional[ProgressCallback] = None,
-    ) -> dict[str, int]:
-        """Fill exact-name and known-citation caches in one partition scan."""
-        return self._prefetch_exact(
-            names,
-            doc_type,
-            lookup_type="name",
-            additional_citations=citations,
-            progress=progress,
-        )
-
-    def _prefetch_exact(
-        self,
-        values: Iterable[str],
-        doc_type: str,
-        *,
-        lookup_type: str,
-        additional_citations: Iterable[str] = (),
-        progress: Optional[ProgressCallback] = None,
-    ) -> dict[str, int]:
-        kind = _kind(doc_type)
-        normalize = (
-            _citation_lookup_key
-            if lookup_type == "citation"
-            else _name_lookup_key
-        )
-        keys = list(dict.fromkeys(filter(None, map(normalize, values))))
-        citation_keys = (
-            list(dict.fromkeys(filter(None, map(
-                _citation_lookup_key, additional_citations
-            ))))
-            if lookup_type == "name"
-            else []
-        )
-        with self._lock:
-            missing = {
-                key: self._query_cache_path(kind, lookup_type, key)
-                for key in keys
-                if not self._query_cache_path(kind, lookup_type, key).is_file()
-            }
-            missing_citations = {
-                key: self._query_cache_path(kind, "citation", key)
-                for key in citation_keys
-                if not self._query_cache_path(kind, "citation", key).is_file()
-            }
-            requested = len(keys) + len(citation_keys)
-            if not missing and not missing_citations:
-                return {
-                    "requested": requested,
-                    "cached": requested,
-                    "partitions": 0,
-                    "rows": 0,
-                }
-            try:
-                import duckdb
-            except ImportError as exc:  # pragma: no cover - packaging guarantees it.
-                raise RuntimeError("Local A2AJ search requires the duckdb package") from exc
-
-            index_path = self._ensure_lookup_index(kind)
-            seeded_citation_paths: dict[str, Path] = dict(missing_citations)
-            seeded_citation_hits: dict[str, list[tuple[str, int]]] = {}
-            with duckdb.connect(str(index_path), read_only=True) as connection:
-                hits = (
-                    connection.execute(
-                        "SELECT DISTINCT lookup_key, path, file_row_number FROM lookups "
-                        "WHERE lookup_type = ? AND lookup_key = ANY(?)",
-                        [lookup_type, list(missing)],
-                    ).fetchall()
-                    if missing else []
-                )
-                if lookup_type == "name" and hits:
-                    discovered_citation_keys = [
-                        str(row[0])
-                        for row in connection.execute(
-                            "SELECT DISTINCT citations.lookup_key "
-                            "FROM lookups AS names "
-                            "JOIN lookups AS citations USING (path, file_row_number) "
-                            "WHERE names.lookup_type = 'name' "
-                            "AND names.lookup_key = ANY(?) "
-                            "AND citations.lookup_type = 'citation'",
-                            [list(missing)],
-                        ).fetchall()
-                    ]
-                    for key in discovered_citation_keys:
-                        cache_path = self._query_cache_path(kind, "citation", key)
-                        if not cache_path.is_file():
-                            seeded_citation_paths.setdefault(key, cache_path)
-                if seeded_citation_paths:
-                    for key, relative, row_number in connection.execute(
-                        "SELECT DISTINCT lookup_key, path, file_row_number "
-                        "FROM lookups WHERE lookup_type = 'citation' "
-                        "AND lookup_key = ANY(?)",
-                        [list(seeded_citation_paths)],
-                    ).fetchall():
-                        seeded_citation_hits.setdefault(str(key), []).append(
-                            (str(relative), int(row_number))
-                        )
-
-            hits_by_key: dict[str, list[tuple[str, int]]] = {}
-            rows_by_path: dict[str, set[int]] = {}
-            for key, relative, row_number in hits:
-                locator = (str(relative), int(row_number))
-                hits_by_key.setdefault(str(key), []).append(locator)
-                rows_by_path.setdefault(str(relative), set()).add(int(row_number))
-            for locators in seeded_citation_hits.values():
-                for relative, row_number in locators:
-                    rows_by_path.setdefault(relative, set()).add(row_number)
-
-            loaded: dict[tuple[str, int], dict] = {}
-            total_partitions = len(rows_by_path)
-            for ordinal, (relative, row_numbers) in enumerate(
-                sorted(rows_by_path.items()), 1
-            ):
-                path = self.root / kind / _safe_relative(relative)
-                with duckdb.connect() as connection:
-                    connection.execute("PRAGMA disable_progress_bar")
-                    cursor = connection.execute(
-                        "SELECT * FROM read_parquet(?, file_row_number=true) "
-                        "WHERE file_row_number = ANY(?)",
-                        [str(path), sorted(row_numbers)],
-                    )
-                    columns = [item[0] for item in cursor.description]
-                    for values in cursor.fetchall():
-                        row = {
-                            column: _json_value(value)
-                            for column, value in zip(columns, values)
-                        }
-                        row_number = int(row.pop("file_row_number"))
-                        loaded[(relative, row_number)] = row
-                _progress(
-                    progress,
-                    kind,
-                    "prefetch",
-                    ordinal,
-                    total_partitions,
-                    relative,
-                )
-
-            for key, cache_path in missing.items():
-                rows = [
-                    loaded[locator]
-                    for locator in hits_by_key.get(key, ())
-                    if locator in loaded
-                ]
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = cache_path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps(rows, ensure_ascii=False), encoding="utf-8"
-                )
-                os.replace(temporary, cache_path)
-            for key, cache_path in seeded_citation_paths.items():
-                rows = [
-                    loaded[locator]
-                    for locator in seeded_citation_hits.get(key, ())
-                    if locator in loaded
-                ]
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = cache_path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps(rows, ensure_ascii=False), encoding="utf-8"
-                )
-                os.replace(temporary, cache_path)
-            return {
-                "requested": requested,
-                "cached": requested - len(missing) - len(missing_citations),
-                "partitions": total_partitions,
-                "rows": len(loaded),
-            }
-
     def _exact_rows(self, doc_type: str, *, citation: str = "", name: str = "") -> list[dict]:
         kind = _kind(doc_type)
         value = citation or name
         lookup_type = "citation" if citation else "name"
         key = _citation_lookup_key(value) if citation else _name_lookup_key(value)
         with self._lock:
-            cache_path = self._query_cache_path(kind, lookup_type, key)
-            try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
-                pass
-            try:
-                import duckdb
-            except ImportError as exc:  # pragma: no cover - packaging guarantees it.
-                raise RuntimeError("Local A2AJ search requires the duckdb package") from exc
-            index_path = self._ensure_lookup_index(kind)
-            with duckdb.connect(str(index_path), read_only=True) as connection:
-                connection.execute("PRAGMA disable_progress_bar")
-                hits = connection.execute(
-                    "SELECT DISTINCT path, file_row_number FROM lookups "
-                    "WHERE lookup_type = ? AND lookup_key = ?",
-                    [lookup_type, key],
-                ).fetchall()
-            rows = []
-            for relative, row_number in hits:
-                path = self.root / kind / _safe_relative(relative)
-                with duckdb.connect() as connection:
-                    connection.execute("PRAGMA disable_progress_bar")
-                    cursor = connection.execute(
-                        "SELECT * EXCLUDE (file_row_number) "
-                        "FROM read_parquet(?, file_row_number=true) WHERE file_row_number = ?",
-                        [str(path), row_number],
-                    )
-                    columns = [item[0] for item in cursor.description]
-                    rows.extend(
-                        {column: _json_value(item) for column, item in zip(columns, row)}
-                        for row in cursor.fetchall()
-                    )
-            try:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = cache_path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps(rows, ensure_ascii=False), encoding="utf-8"
-                )
-                os.replace(temporary, cache_path)
-            except OSError:
-                # The cache is optional; a read-only or temporarily locked
-                # cache must not turn a successful local lookup into an error.
-                pass
-            return rows
+            sqlite_rows = self._runtime_rows(kind, lookup_type, key)
+            if sqlite_rows is None:
+                raise RuntimeError("The shared A2AJ SQLite corpus is not installed")
+            return sqlite_rows
 
-    def _ensure_lookup_index(self, kind: str) -> Path:
-        active = self.root / kind
-        manifest = self._read_manifest(kind)
-        if not manifest:
-            raise RuntimeError(f"The local A2AJ {kind} corpus is not installed")
-        revision = str(manifest.get("revision") or "")
-        index_path = active / "lookup.duckdb"
-        if index_path.is_file():
-            try:
-                import duckdb
-                with duckdb.connect(str(index_path), read_only=True) as connection:
-                    indexed = dict(connection.execute(
-                        "SELECT key, value FROM metadata WHERE key IN ('revision', 'schema')"
-                    ).fetchall())
-                if indexed.get("revision") == revision and indexed.get("schema") == "5":
-                    return index_path
-            except Exception:
-                pass
-        files = tuple(CorpusFile(**item) for item in manifest.get("files") or ())
-        self._build_lookup_index(active, files, revision)
-        return index_path
+    def _runtime_rows(
+        self, kind: str, lookup_type: str, key: str,
+    ) -> Optional[list[dict]]:
+        """Read the derived full-text SQLite product, or decline its contract.
 
-    def _build_lookup_index(
-        self, snapshot_root: Path, files: Iterable[CorpusFile], revision: str,
-    ) -> None:
+        ``None`` means this is not a usable full-text runtime database. An
+        empty list is a real indexed miss. Metadata-only stores are rejected
+        rather than being mistaken for successful empty source documents.
+        """
+        path = self.runtime_db
+        if not key or not path.is_file():
+            return None
         try:
-            import duckdb
-        except ImportError as exc:  # pragma: no cover - packaging guarantees it.
-            raise RuntimeError("Local A2AJ search requires the duckdb package") from exc
-        target = snapshot_root / "lookup.duckdb"
-        temporary = snapshot_root / "lookup.duckdb.part"
-        temporary.unlink(missing_ok=True)
-        try:
-            with duckdb.connect(str(temporary)) as connection:
-                connection.execute("PRAGMA disable_progress_bar")
-                connection.execute("CREATE TABLE metadata(key VARCHAR PRIMARY KEY, value VARCHAR)")
-                connection.execute(
-                    "CREATE TABLE lookups(path VARCHAR, file_row_number BIGINT, field_name VARCHAR, "
-                    "exact_value VARCHAR, lookup_type VARCHAR, lookup_key VARCHAR)"
-                )
-                for item in files:
-                    path = snapshot_root / _safe_relative(item.path)
-                    columns = set(connection.from_parquet(str(path)).columns)
-                    for lookup_type, fields in (
-                        ("citation", ("citation_en", "citation2_en", "citation_fr", "citation2_fr")),
-                        ("name", ("name_en", "name_fr")),
-                    ):
-                        available = [field for field in fields if field in columns]
-                        if not available:
-                            continue
-                        for field in available:
-                            lookup_expression = (
-                                _citation_lookup_sql(field)
-                                if lookup_type == "citation"
-                                else _name_lookup_sql(field)
-                            )
-                            connection.execute(
-                                "INSERT INTO lookups "
-                                f"SELECT ?, file_row_number, ?, {field}, ?, {lookup_expression} "
-                                f"FROM read_parquet(?, file_row_number=true) "
-                                f"WHERE trim(coalesce({field}, '')) <> ''",
-                                [item.path, field, lookup_type, str(path)],
-                            )
-                connection.execute(
-                    "CREATE INDEX lookup_key_idx ON lookups(lookup_type, lookup_key)"
-                )
-                connection.execute(
-                    "INSERT INTO metadata VALUES ('revision', ?)", [revision]
-                )
-                connection.execute("INSERT INTO metadata VALUES ('schema', '5')")
-                connection.execute("CHECKPOINT")
-            os.replace(temporary, target)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-
-    def _query_cache_path(self, kind: str, lookup_type: str, key: str) -> Path:
-        digest = hashlib.sha256(f"v5\0{lookup_type}\0{key}".encode("utf-8")).hexdigest()
-        return self.root / kind / "query_cache" / f"{digest}.json"
-
-    def _scan_rows(self, kind: str, value: str, fields: tuple[str, ...]) -> list[dict]:
-        """Legacy direct scan retained for diagnostics and compatibility."""
-        paths = self._paths_for_query(kind, self._parquet_paths(kind), value)
-        if not paths:
-            return []
-        import duckdb
-        with self._lock, duckdb.connect() as connection:
-            connection.execute("PRAGMA disable_progress_bar")
-            relation = connection.from_parquet([str(path) for path in paths], union_by_name=True)
-            available = [field for field in fields if field in relation.columns]
-            if not available:
-                return []
-            exact_where = " OR ".join(
-                f"coalesce({field}, '') = ?" for field in available
+            connection = sqlite3.connect(
+                f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1.0
             )
-            where = " OR ".join(
-                f"lower(trim(coalesce({field}, ''))) = lower(trim(?))" for field in available
-            )
-            relation.create_view("a2aj_local")
-            cursor = connection.execute(
-                f"SELECT * FROM a2aj_local WHERE {exact_where}",
-                [value] * len(available),
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                cursor = connection.execute(
-                    f"SELECT * FROM a2aj_local WHERE {where}",
-                    [value] * len(available),
-                )
-                rows = cursor.fetchall()
-            columns = [item[0] for item in cursor.description]
-            return [
-                {column: _json_value(value) for column, value in zip(columns, row)}
-                for row in rows
-            ]
+            connection.row_factory = sqlite3.Row
+            try:
+                metadata = dict(connection.execute(
+                    "SELECT key, value FROM meta "
+                    "WHERE key IN ('metadata_only', 'schema_version')"
+                ).fetchall())
+                if (
+                    str(metadata.get("metadata_only", "")).casefold() == "true"
+                    or int(metadata.get("schema_version", "0")) < 3
+                ):
+                    return None
+                if lookup_type == "citation":
+                    sql = (
+                        "SELECT document.* FROM citation_lookup AS lookup "
+                        "JOIN document ON document.id = lookup.document_id "
+                        "WHERE lookup.citation_key = ? AND document.doc_type = ? "
+                        "ORDER BY document.id"
+                    )
+                else:
+                    has_names = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'name_lookup'"
+                    ).fetchone()
+                    if not has_names:
+                        return None
+                    sql = (
+                        "SELECT document.* FROM name_lookup AS lookup "
+                        "JOIN document ON document.id = lookup.document_id "
+                        "WHERE lookup.name_key = ? AND document.doc_type = ? "
+                        "ORDER BY document.id"
+                    )
+                rows = connection.execute(sql, (key, kind)).fetchall()
+                return [self._runtime_row(dict(row)) for row in rows]
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return None
 
     @staticmethod
-    def _paths_for_query(kind: str, paths: list[Path], value: str) -> list[Path]:
-        def dataset_paths(dataset: str) -> list[Path]:
-            wanted = dataset.upper()
-            return [
-                path for path in paths
-                if any(parent.name.upper() == wanted for parent in path.parents)
-            ]
+    def _runtime_row(row: dict) -> dict:
+        # The shared SQLite contract calls the official provider URL ``url``;
+        # the public A2AJ wire shape calls it ``source_url`` for laws.
+        result = dict(row)
+        result["source_url_en"] = result.get("url_en")
+        result["source_url_fr"] = result.get("url_fr")
+        return result
 
-        value = str(value or "")
-        if kind == "cases":
-            for match in _NEUTRAL_CITATION_RE.finditer(value):
-                matching = dataset_paths(match.group(1))
-                if matching:
-                    return matching
-        elif kind == "laws":
-            for pattern, dataset in _LAW_DATASET_PATTERNS:
-                if re.search(pattern, value, re.I):
-                    matching = dataset_paths(dataset)
-                    if matching:
-                        return matching
-        return paths
+    def _runtime_database_ready(self) -> bool:
+        if self._runtime_rows("cases", "citation", "__a2aj_contract_probe__") is None:
+            return False
+        expected = {
+            kind: str(manifest.get("revision") or "")
+            for kind in ("cases", "laws")
+            if (manifest := self._read_manifest(kind))
+        }
+        try:
+            connection = sqlite3.connect(
+                f"file:{self.runtime_db.as_posix()}?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                row = connection.execute(
+                    "SELECT value FROM meta WHERE key = 'source_revisions'"
+                ).fetchone()
+            finally:
+                connection.close()
+            return bool(expected) and json.loads(row[0] if row else "{}") == expected
+        except (OSError, ValueError, sqlite3.Error):
+            return False
 
-    def _parquet_paths(self, kind: str) -> list[Path]:
-        active = self.root / kind
-        manifest = self._read_manifest(kind)
-        if not manifest:
-            return []
-        return [active / _safe_relative(item["path"]) for item in manifest.get("files") or ()]
+    def runtime_ready(self) -> bool:
+        """Whether the shared full-text SQLite corpus is queryable."""
+        return self._runtime_database_ready()
+
+    def build_runtime_database(
+        self,
+        *,
+        progress: Optional[ProgressCallback] = None,
+        cancelled: Optional[CancelCallback] = None,
+    ) -> Path:
+        """Compile installed Parquet snapshots into the one runtime SQLite DB.
+
+        DuckDB is deliberately confined to this on-demand import operation.
+        The completed database is atomically swapped, so Beaver and ALR never
+        observe a partial corpus and never need DuckDB for ordinary lookup.
+        """
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise RuntimeError(
+                "Installing the A2AJ corpus requires the optional duckdb importer"
+            ) from exc
+
+        sources: list[tuple[str, str, Path]] = []
+        revisions: dict[str, str] = {}
+        for kind in ("cases", "laws"):
+            manifest = self._read_manifest(kind)
+            if not manifest:
+                continue
+            revisions[kind] = str(manifest.get("revision") or "")
+            for item in manifest.get("files") or ():
+                relative = str(item.get("path") or "")
+                if not relative:
+                    continue
+                path = self.root / kind / _safe_relative(relative)
+                if path.is_file():
+                    dataset = PurePosixPath(relative).parts[0]
+                    sources.append((kind, dataset, path))
+        if not sources:
+            raise RuntimeError("No installed A2AJ source snapshots were found")
+
+        target = self.runtime_db
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".new")
+        temporary.unlink(missing_ok=True)
+        sqlite = sqlite3.connect(temporary)
+        document_id = citation_count = name_count = 0
+        schema = """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE document(
+                id INTEGER PRIMARY KEY, doc_type TEXT NOT NULL, dataset TEXT NOT NULL,
+                citation_en TEXT, citation_fr TEXT, citation2_en TEXT, citation2_fr TEXT,
+                name_en TEXT, name_fr TEXT, document_date_en TEXT, document_date_fr TEXT,
+                url_en TEXT, url_fr TEXT, unofficial_text_en TEXT, unofficial_text_fr TEXT,
+                unofficial_sections_en TEXT, unofficial_sections_fr TEXT,
+                cases_cited_en TEXT, cases_cited_fr TEXT,
+                cases_citing_en TEXT, cases_citing_fr TEXT,
+                citing_cases_count INTEGER, upstream_license TEXT
+            );
+            CREATE TABLE citation_lookup(
+                citation_key TEXT NOT NULL, document_id INTEGER NOT NULL,
+                PRIMARY KEY(citation_key, document_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE name_lookup(
+                name_key TEXT NOT NULL, document_id INTEGER NOT NULL,
+                PRIMARY KEY(name_key, document_id)
+            ) WITHOUT ROWID;
+        """
+
+        def value(row: dict, stem: str, language: str = ""):
+            for key in ((f"{stem}_{language}", stem) if language else (stem,)):
+                item = _json_value(row.get(key))
+                if isinstance(item, (dict, list)):
+                    item = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                if item is not None and str(item).strip():
+                    return item
+            return None
+
+        try:
+            sqlite.executescript(
+                "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; "
+                "PRAGMA temp_store=MEMORY;" + schema
+            )
+            for ordinal, (kind, dataset_hint, path) in enumerate(sources, 1):
+                self._check_cancel(cancelled)
+                with duckdb.connect() as parquet:
+                    parquet.execute("PRAGMA disable_progress_bar")
+                    cursor = parquet.execute("SELECT * FROM read_parquet(?)", [str(path)])
+                    columns = [item[0] for item in cursor.description]
+                    while True:
+                        batch = cursor.fetchmany(500)
+                        if not batch:
+                            break
+                        documents = []
+                        citations = []
+                        names = []
+                        for raw in batch:
+                            row = dict(zip(columns, raw))
+                            citation_values = [
+                                value(row, stem, language)
+                                for language in ("en", "fr")
+                                for stem in ("citation", "citation2")
+                            ]
+                            citation_keys = {
+                                _citation_lookup_key(item)
+                                for item in citation_values if item
+                            }
+                            if not citation_keys:
+                                continue
+                            document_id += 1
+                            dataset = str(value(row, "dataset") or dataset_hint)
+                            name_values = [value(row, "name", lang) for lang in ("en", "fr")]
+                            documents.append((
+                                document_id, kind, dataset,
+                                value(row, "citation", "en"), value(row, "citation", "fr"),
+                                value(row, "citation2", "en"), value(row, "citation2", "fr"),
+                                name_values[0], name_values[1],
+                                value(row, "document_date", "en"), value(row, "document_date", "fr"),
+                                value(row, "source_url", "en") or value(row, "url", "en"),
+                                value(row, "source_url", "fr") or value(row, "url", "fr"),
+                                value(row, "unofficial_text", "en"), value(row, "unofficial_text", "fr"),
+                                value(row, "unofficial_sections", "en"), value(row, "unofficial_sections", "fr"),
+                                value(row, "cases_cited", "en"), value(row, "cases_cited", "fr"),
+                                value(row, "cases_citing", "en"), value(row, "cases_citing", "fr"),
+                                row.get("citing_cases_count"), value(row, "upstream_license"),
+                            ))
+                            citations.extend((item, document_id) for item in citation_keys)
+                            names.extend(
+                                (item, document_id)
+                                for item in {
+                                    _name_lookup_key(name) for name in name_values if name
+                                }
+                                if item
+                            )
+                        if documents:
+                            sqlite.executemany(
+                                f"INSERT INTO document VALUES ({','.join('?' for _ in range(23))})",
+                                documents,
+                            )
+                            sqlite.executemany("INSERT INTO citation_lookup VALUES (?,?)", citations)
+                            sqlite.executemany("INSERT INTO name_lookup VALUES (?,?)", names)
+                            citation_count += len(citations)
+                            name_count += len(names)
+                sqlite.commit()
+                _progress(progress, kind, "index", ordinal, len(sources), path.name)
+            sqlite.execute("CREATE INDEX document_dataset_idx ON document(doc_type,dataset)")
+            metadata = {
+                "schema_version": "3",
+                "metadata_only": "false",
+                "document_count": str(document_id),
+                "citation_count": str(citation_count),
+                "name_count": str(name_count),
+                "source_revisions": json.dumps(revisions, sort_keys=True),
+                "imported_at": datetime.now(timezone.utc).isoformat(),
+            }
+            sqlite.executemany("INSERT INTO meta VALUES (?,?)", metadata.items())
+            sqlite.commit()
+            sqlite.execute("ANALYZE")
+            sqlite.commit()
+        except BaseException:
+            sqlite.close()
+            temporary.unlink(missing_ok=True)
+            raise
+        else:
+            sqlite.close()
+            os.replace(temporary, target)
+            return target
 
     def _download_file(
         self, remote: RemoteSnapshot, item: CorpusFile, destination: Path,
@@ -825,34 +716,6 @@ class LocalA2AJCorpus:
             shutil.copy2(source, destination)
 
     @staticmethod
-    def _parquet_equivalent(first: Path, second: Path) -> bool:
-        """Return whether two Parquet files contain the same rows in any order."""
-        try:
-            import duckdb
-        except ImportError as exc:  # pragma: no cover - packaging guarantees it.
-            raise RuntimeError("Local A2AJ updates require the duckdb package") from exc
-        difference = (
-            "SELECT count(*) FROM ("
-            "SELECT * FROM read_parquet(?) "
-            "EXCEPT ALL "
-            "SELECT * FROM read_parquet(?)"
-            ")"
-        )
-        try:
-            with duckdb.connect() as connection:
-                connection.execute("PRAGMA disable_progress_bar")
-                return (
-                    connection.execute(
-                        difference, [str(first), str(second)]
-                    ).fetchone()[0] == 0
-                    and connection.execute(
-                        difference, [str(second), str(first)]
-                    ).fetchone()[0] == 0
-                )
-        except Exception:
-            return False
-
-    @staticmethod
     def _check_cancel(cancelled: Optional[CancelCallback]) -> None:
         if cancelled and cancelled():
             raise InstallCancelled("A2AJ corpus installation cancelled")
@@ -876,18 +739,6 @@ def _citation_lookup_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
 
-def _citation_lookup_sql(field: str) -> str:
-    expression = f"lower(trim({field}))"
-    expression = f"replace(replace({expression}, '\u2013', '-'), '\u2014', '-')"
-    for punctuation, marker in ((r"\.", "dot"), ("-", "dash"), ("/", "slash")):
-        for _ in range(4):
-            expression = (
-                f"regexp_replace({expression}, '([0-9]){punctuation}([0-9])', "
-                f"'\\1{marker}\\2', 'g')"
-            )
-    return f"regexp_replace({expression}, '[^a-z0-9]+', '', 'g')"
-
-
 def _name_lookup_key(value: str) -> str:
     value = str(value or "")
     value = re.sub(r"(\w)\.(\w)\.?", r"\1\2", value)
@@ -895,25 +746,6 @@ def _name_lookup_key(value: str) -> str:
     value = re.sub(r"[-\u2010-\u2015/]+", " ", value)
     value = re.sub(r"[^\w\s]", "", value)
     return " ".join(value.split()).lower()
-
-
-def _name_lookup_sql(field: str) -> str:
-    expression = (
-        f"regexp_replace({field}, "
-        r"'([\p{L}\p{N}_])\.([\p{L}\p{N}_])\.?', '\1\2', 'g')"
-    )
-    expression = (
-        f"regexp_replace({expression}, '\\s+[vV]\\.?\\s+', ' v ', 'g')"
-    )
-    expression = (
-        f"regexp_replace({expression}, "
-        r"'[/\x{2010}-\x{2015}-]+', ' ', 'g')"
-    )
-    expression = (
-        f"regexp_replace({expression}, "
-        r"'[^\p{L}\p{N}_\s]', '', 'g')"
-    )
-    return f"lower(trim(regexp_replace({expression}, '\\s+', ' ', 'g')))"
 
 
 def _safe_relative(value: str) -> Path:
