@@ -1,0 +1,286 @@
+{
+  "format": "beaver-grammar-table:v1",
+  "description": "Citation grammars extracted VERBATIM from the deterministic-citations lineage (ALR verifier_core/deterministic_splitter.py == engine legalpdf/deterministic_citations.py, md5-verified 2026-07-29) and from toa_maker.py where it diverges — dialects preserved side by side, never merged. Authoring rules: JS-style named groups (added groups are provenance-marked; they wrap existing alternations without changing match semantics); leading (?i) hoisted to table flags; invisible characters stay \\uXXXX escapes, visible non-ASCII stays literal. Python compiles with re.ASCII, JS without the u flag.",
+  "defs": {
+    "reporter_words": "[A-Z][A-Za-z&.'-]{1,16}(?:\\s+[A-Z][A-Za-z&.'-]{1,16}){0,4}",
+    "ca_statute_series": "R\\.?S\\.?N\\.?W\\.?T\\.?|S\\.?N\\.?W\\.?T\\.?|R\\.?S\\.?P\\.?E\\.?I\\.?|S\\.?P\\.?E\\.?I\\.?|C\\.?C\\.?S\\.?M\\.?|R\\.?S\\.?N\\.?B\\.?|S\\.?N\\.?B\\.?|R\\.?S\\.?N\\.?S\\.?|S\\.?N\\.?S\\.?|R\\.?S\\.?N\\.?L\\.?|S\\.?N\\.?L\\.?|R\\.?S\\.?B\\.?C\\.?|S\\.?B\\.?C\\.?|R\\.?S\\.?C\\.?|R\\.?S\\.?O\\.?|R\\.?S\\.?A\\.?|R\\.?S\\.?S\\.?|R\\.?S\\.?M\\.?|R\\.?S\\.?Y\\.?|S\\.?C\\.?|S\\.?O\\.?|S\\.?A\\.?|S\\.?S\\.?|S\\.?M\\.?|S\\.?Y\\.?",
+    "fr_statute_series": "C\\.?P\\.?L\\.?M\\.?|R\\.?L\\.?R\\.?Q\\.?|C\\.?Q\\.?L\\.?R\\.?|L\\.?R\\.?C\\.?|L\\.?R\\.?O\\.?|L\\.?R\\.?M\\.?|L\\.?C\\.?|L\\.?O\\.?|L\\.?M\\.?"
+  },
+  "entries": [
+    {
+      "id": "cite.neutral",
+      "pattern": "\\b(?<year>(?:17|18|19|20)\\d{2})\\s+(?<court>[A-Z][A-Z0-9-]{1,15})\\s+(?<num>\\d+)\\b",
+      "flags": "",
+      "canonical": {
+        "lowercase": ["court"],
+        "map": {
+          "court": { "csc": "scc", "caf": "fca", "cf": "fc", "cfpi": "fc", "cci": "tcc" }
+        }
+      },
+      "provenance": "splitter.py:12 == deterministic_citations.py:12 == toa_maker.py:83 (_NEUTRAL_RE, all byte-identical). Named groups and the FR->EN court canonicalization map are beaver-authored additions; the groups wrap existing subexpressions without changing what matches.",
+      "vectors": [
+        {
+          "input": "As held in 2019 SCC 65, the standard is reasonableness.",
+          "groups": { "year": "2019", "court": "SCC", "num": "65" },
+          "canonical": { "court": "scc" }
+        },
+        {
+          "input": "Voir 2019 CSC 65 au para 23.",
+          "groups": { "year": "2019", "court": "CSC", "num": "65" },
+          "canonical": { "court": "scc" }
+        },
+        {
+          "input": "in 1875 SCC 4 (lineage accepts 17xx-20xx)",
+          "groups": { "year": "1875", "court": "SCC", "num": "4" }
+        },
+        { "input": "2019SCC65 run together", "groups": null },
+        { "input": "Guttman v Law Society of Manitoba, 2010 MBCA 66 at para 75", "groups": { "year": "2010", "court": "MBCA", "num": "66" } },
+        {
+          "input": "See R v LVR, 2014 BCCA 349 at paras 24-26 (NBSP-separated, as CanLII renders).",
+          "groups": { "year": "2014", "court": "BCCA", "num": "349" }
+        }
+      ]
+    },
+    {
+      "id": "cite.neutral.tribunal",
+      "pattern": "\\b(?<year>(?:17|18|19|20)\\d{2})\\s+(?<court>Comp\\.\\s+Trib\\.|Trib\\.\\s+conc\\.|Comp\\s+Trib\\.|CAPPRT\\s+LD|Comp\\s+Trib|Comp\\s+trib|TCRPAP\\s+LD|TRIB\\s+COMP|Trib\\s+Comp|Trib\\s+Conc|Trib\\s+conc|CCRI\\s+LD|CIRB\\s+LD)\\s+(?<num>\\d+)\\b",
+      "flags": "",
+      "canonical": {
+        "lowercase": ["court"],
+        "strip": { "court": "." },
+        "map": {
+          "court": { "trib conc": "comp trib", "trib comp": "comp trib", "ccri ld": "cirb ld", "tcrpap ld": "capprt ld" }
+        }
+      },
+      "provenance": "Sibling of cite.neutral for the multi-token tribunal dialect. Year/separators/num are VERBATIM from _NEUTRAL_RE (splitter.py:12); the closed-alternation shape is cite.statute.splitter's own series-code mechanism; the 13 members are exactly the surfaces A2AJ providers attest — 8 from citation columns (Comp Trib 1268, Trib conc 1004, CAPPRT LD 6, TCRPAP LD 6, CIRB LD 1, CCRI LD 1, Comp Trib. 1, TRIB COMP 1), 5 from judgment prose (Trib Conc 10, Comp. Trib. 5, Comp trib 2, Trib Comp 2, Trib. conc. 1); longest-first ordering; FR->EN map mirrors cite.neutral's court map (same tribunals renamed). Excluded: the one-off 'ON CA' authoring typo. Measured (probes/cite_class1_*): CT/fr recall 95.3->100.0 with 0 residual; 195 matches over 26.1 MB judgment text, 0 false positives; 0 new matches on 1,860 footnotes + 500 paragraphs. The generic two-token alternative produced 6 FP on the same corpora.",
+      "vectors": [
+        { "input": "Neutral citation 2020 Comp Trib 6 File Number CT-2020-003", "groups": { "year": "2020", "court": "Comp Trib", "num": "6" }, "canonical": { "court": "comp trib" } },
+        { "input": "la concurrence c Superior Propane Inc, 2000 Trib conc 8 o N de dossier", "groups": { "year": "2000", "court": "Trib conc", "num": "8" }, "canonical": { "court": "comp trib" } },
+        { "input": "Référence neutre 2020 Trib Conc 5 Numéro de dossier CT-2020", "groups": { "year": "2020", "court": "Trib Conc", "num": "5" } },
+        { "input": "and Office Depot, Inc., 2016 Comp. Trib. 6 File No.: CT-2015-012", "groups": { "year": "2016", "court": "Comp. Trib.", "num": "6" } },
+        { "input": "et Garda World Security Corporation, 2019 Trib. conc. 5 N° de dossier", "groups": { "year": "2019", "court": "Trib. conc.", "num": "5" } },
+        { "input": "see Nav Canada, 2000 CIRB LD 213, affirmed in NAV Canada", "groups": { "year": "2000", "court": "CIRB LD", "num": "213" } },
+        { "input": "voir Nav Canada, 2000 CCRI LD 213, confirmée dans NAV Canada", "groups": { "year": "2000", "court": "CCRI LD", "num": "213" }, "canonical": { "court": "cirb ld" } },
+        { "input": "2010 CAPPRT LD 108", "groups": { "year": "2010", "court": "CAPPRT LD", "num": "108" } },
+        { "input": "the period from 1996 to December 31, 1997", "groups": null },
+        { "input": "entre 1996 et le 31 décembre 1997", "groups": null },
+        { "input": "R v Smith, 2019 SCC 65 at para 3", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.statute.judgment",
+      "pattern": "\\b(?<series>{{ca_statute_series}}),?\\s+(?:\\(?(?<year>\\d{4})\\)?,?\\s+)?c\\.\\s?(?<chapter>[A-Za-z0-9.\\-]+)(?:,\\s*Sched(?:ule)?\\.?\\s*(?<schedule>[A-Za-z0-9]+))?(?:,\\s*ss?\\.\\s*(?<section>\\d[\\w().]*))?",
+      "flags": "",
+      "canonical": { "lowercase": ["series"], "strip": { "series": "." } },
+      "provenance": "EXTRACTED VERBATIM from backend/src/lib/legalTextAnchors.ts STATUTE_CANADIAN_RE (~line 249) — the shipped judgment-side statute grammar; member list is CA_STATUTE_SERIES unchanged; the R\\.?S\\.?C\\.? dotting is that file's CA_SERIES_PATTERN mechanism; Sched(ule) and ss. tails byte-identical. Beaver-authored: named groups over existing captures; canonical lowercase+strip so R.S.C. and RSC share a key. Measured (probes/cite_class2_*): 146 matches in 48/120 SCC/en judgments where both footnote-lineage statute entries score 0; 41.5% of 629 census occurrences (89% of dotted/'c.'); span-identical to the TS source over 4,350 documents; 0 false positives on footnotes and paragraphs. Sibling — the footnote dialect entries stay untouched.",
+      "vectors": [
+        { "input": "Criminal Code, R.S.C. 1985, c. C-46, s. 732.1(3)(c).", "groups": { "series": "R.S.C.", "year": "1985", "chapter": "C-46", "section": "732.1(3)(c)." }, "canonical": { "series": "rsc" } },
+        { "input": "Excise Tax Act, R.S.C. 1985, c. E-15", "groups": { "series": "R.S.C.", "year": "1985", "chapter": "E-15" } },
+        { "input": "Income Tax Act, R.S.C. 1985, c. 1 (5th Supp.)", "groups": { "series": "R.S.C.", "year": "1985", "chapter": "1" } },
+        { "input": "R.S.C., 1985, c. P-21", "groups": { "series": "R.S.C.", "year": "1985", "chapter": "P-21" } },
+        { "input": "Courts of Justice Act, R.S.O. 1990, c. C.43", "groups": { "series": "R.S.O.", "year": "1990", "chapter": "C.43" } },
+        { "input": "S.O. 1997, c. 16, Sched. A", "groups": { "series": "S.O.", "year": "1997", "chapter": "16", "schedule": "A" } },
+        { "input": "the Act, S.N.S. 2001 c. 6, ss. 74", "groups": { "series": "S.N.S.", "year": "2001", "chapter": "6", "section": "74" } },
+        { "input": "RSC 1985, c C-46", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.statute.judgment.fr",
+      "pattern": "\\b(?<series>{{fr_statute_series}}),?\\s+(?:\\(?(?<year>\\d{4})\\)?,?\\s+)?ch?\\.\\s?(?<chapter>[A-Za-z0-9.\\-]+)(?:,\\s*ann(?:exe)?\\.?\\s*(?<schedule>[A-Za-z0-9]+))?(?:,\\s*(?:art|par)\\.\\s*(?<section>\\d[\\w().]*))?",
+      "flags": "",
+      "canonical": {
+        "lowercase": ["series"],
+        "strip": { "series": "." },
+        "map": {
+          "series": { "lrc": "rsc", "lro": "rso", "lrm": "rsm", "lc": "sc", "lo": "so", "lm": "sm", "cplm": "ccsm", "rlrq": "cqlr" }
+        }
+      },
+      "provenance": "EXTRACTED VERBATIM from backend/src/lib/legalTextAnchors.ts STATUTE_CANADIAN_FR_RE (~line 273); member list = Object.keys(FR_STATUTE_SERIES) unchanged; ch?\\. accepting 'c.' and 'ch.', ann(exe) and (art|par). tails byte-identical. Beaver-authored: named groups; canonical map = FR_STATUTE_SERIES' own value side (LRC->rsc, LC->sc, CPLM->ccsm, RLRQ->cqlr) for bilingual concordance. Measured: 373 matches in 66/120 SCC/fr judgments where both footnote-lineage entries score 0; 34.7% of census occurrences (76% of dotted/'ch.'); span-identical to the TS source over 4,350 documents; 0 false positives.",
+      "vectors": [
+        { "input": "Loi canadienne sur les droits de la personne, L.R.C. (1985), ch. H-6", "groups": { "series": "L.R.C.", "year": "1985", "chapter": "H-6" }, "canonical": { "series": "rsc" } },
+        { "input": "L.R.C. 1985, ch. C-46", "groups": { "series": "L.R.C.", "year": "1985", "chapter": "C-46" } },
+        { "input": "LIPR, L.C. 2001, ch. 27", "groups": { "series": "L.C.", "year": "2001", "chapter": "27" }, "canonical": { "series": "sc" } },
+        { "input": "L.R.O. 1980, ch. 321, art. 37(1)", "groups": { "series": "L.R.O.", "year": "1980", "chapter": "321", "section": "37(1)" } },
+        { "input": "L.R.O. 1990, chap. F.32", "groups": null },
+        { "input": "RSC 1985, c C-46", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.canlii",
+      "pattern": "\\b(?:17|18|19|20)\\d{2}\\s+CanLII\\s+\\d+\\b",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "toa_maker.py:84 (_CANLII_RE). No splitter counterpart (splitter's _NEUTRAL_RE cannot match mixed-case CanLII).",
+      "vectors": [
+        { "input": "R v Smith, 2015 CanLII 12345 (ON CA).", "groups": {} },
+        { "input": "cited to CanLII without a year", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.reporter.splitter",
+      "pattern": "(?<![\\w.])(?:\\[(?:17|18|19|20)\\d{2}\\]\\s+(?:\\d{1,4}\\s+)?{{reporter_words}}(?:\\s+\\(\\d+[A-Za-z]{0,3}\\))?\\s+\\d{1,5}|\\((?:17|18|19|20)\\d{2}\\)\\s+(?:\\d{1,4}\\s+)?{{reporter_words}}(?:\\s+\\(\\d+[A-Za-z]{0,3}\\))?\\s+\\d{1,5}|\\d{1,4}\\s+{{reporter_words}}(?:\\s+\\(\\d+[A-Za-z]{0,3}\\))?\\s+\\d{1,5})(?=\\s*(?:[,;.]|\\bat\\b|\\band\\b|\\bwith\\b|\\(|\\[|$))",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:14-23 (_REPORTER_RE, three-branch: [year] / (year) / bare-volume, built on _REPORTER_WORDS which is the reporter_words def). Trailing lookahead bounds the match at clause edges. Recall-first routing evidence by design.",
+      "vectors": [
+        { "input": "R v Oakes, [1986] 1 SCR 103;", "groups": {} },
+        { "input": "(1990) 71 OR (2d) 725.", "groups": {} },
+        { "input": "R v Bernard, [1988] 2 S.C.R. 833 at 880.", "groups": {} },
+        { "input": "no volume no reporter here", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.reporter.toa",
+      "pattern": "(?<![\\w.])(?:\\[(?:17|18|19|20)\\d{2}\\]\\s+)?\\d{1,4}\\s+[A-Z][A-Za-z0-9&.'-]{1,20}(?:\\s+\\([0-9A-Za-z]{1,4}\\))?(?:\\s+[A-Z][A-Za-z0-9&.'-]{0,14}){0,3}\\s+\\d{1,6}\\b",
+      "flags": "",
+      "canonical": {},
+      "provenance": "toa_maker.py:85-89 (_REPORTER_RE). Dialect vs splitter: single branch, volume mandatory, digits allowed inside reporter words, page \\d{1,6}, NO re.I, no trailing clause-edge lookahead.",
+      "vectors": [
+        { "input": "R v Oakes, [1986] 1 SCR 103;", "groups": {} },
+        { "input": "cited at 71 OR (2d) 725 in passing", "groups": {} },
+        { "input": "lowercase 1 scr 103 stays unmatched (no re.I in this dialect)", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.statute.splitter",
+      "pattern": "\\b(?:RSC|RSO|RSA|RSS|RSM|RSQ|RSY|RSBC|RSNL|RSNB|RSNS|RSPEI|RSNWT|SC|SO|SA|SS|SM|SQ|SY|SBC|SNL|SNB|SNS|SNWT|CQLR|CCSM)\\b\\s*[, ]\\s*\\d{4}(?:\\s*,?\\s*c\\s+[A-Za-z0-9.-]+)?",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:24-29 (_STATUTE_RE). Chapter class [A-Za-z0-9.-] — no parentheses.",
+      "vectors": [
+        { "input": "Criminal Code, RSC 1985, c C-46, s 672.54(a)", "groups": {} },
+        { "input": "CQLR c C-12, art 10", "groups": null },
+        { "input": "SO 1990, c H.8", "groups": {} }
+      ]
+    },
+    {
+      "id": "cite.statute.toa",
+      "pattern": "\\b(?:RSC|RSO|RSA|RSS|RSM|RSQ|RSY|RSBC|RSNL|RSNB|RSNS|RSPEI|RSNWT|CQLR|CCSM|SC|SO|SA|SS|SM|SQ|SY|SBC|SNL|SNB|SNS|SNWT)\\b\\s*[, ]\\s*\\d{4}(?:\\s*,?\\s*c\\s+[A-Za-z0-9().-]+)?|\\b(?:Alta Reg|BC Reg|B C Reg|O Reg|OIC|SOR|SI|SOR/|CFR)\\s*[A-Za-z-]*\\s*\\d{2,4}[-/]\\d{1,4}\\b",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "toa_maker.py:90-96 (_STATUTE_RE). Dialect vs splitter: CQLR/CCSM hoisted ahead of the two-letter codes, chapter class gains parentheses, and a second branch covers regulations (Alta Reg / BC Reg / O Reg / OIC / SOR / SI / CFR).",
+      "vectors": [
+        { "input": "Criminal Code, RSC 1985, c C-46", "groups": {} },
+        { "input": "O Reg 213/91, s 1", "groups": {} },
+        { "input": "SOR/98-106 applies", "groups": {} },
+        { "input": "no statute series here", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.journal.splitter",
+      "pattern": "\\(?(?:17|18|19|20)\\d{2}\\)?\\s+\\d{1,4}(?::\\s*[A-Za-z0-9.-]+)?\\s+[A-Z][A-Za-z&.'’(), -]{1,100}?\\s+\\d{1,5}\\b",
+      "flags": "",
+      "canonical": {},
+      "provenance": "splitter.py:30-34 (_JOURNAL_RE). Title class includes U+2019 right single quote.",
+      "vectors": [
+        { "input": "(2019) 97 Can Bar Rev 1 at 12", "groups": {} },
+        { "input": "(2020) 45 Queen’s 221", "groups": {} },
+        { "input": "a paper from 2019 with no volume", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.journal.toa",
+      "pattern": "\\(?(?:17|18|19|20)\\d{2}\\)?\\s+\\d{1,4}(?::\\s*[A-Za-z0-9.-]+)?\\s+[A-Z][A-Za-z&.'(), -]{1,100}?\\s+\\d{1,5}\\b",
+      "flags": "",
+      "canonical": {},
+      "provenance": "toa_maker.py:97-100 (_JOURNAL_RE). Dialect vs splitter: one character — the title class drops U+2019. The Queen’s vector is the discriminating pair.",
+      "vectors": [
+        { "input": "(2019) 97 Can Bar Rev 1 at 12", "groups": {} },
+        { "input": "(2020) 45 Queen’s 221", "groups": null }
+      ]
+    },
+    {
+      "id": "title.legal.splitter",
+      "pattern": "(?<!\\w)(?:(?:and\\s+)?the\\s+)?[A-Z][A-Za-z'’() -]{1,100}?\\s+(?:Act|Code|Rules?|Regulations?|Convention|Treaty)(?=\\b|,)",
+      "flags": "",
+      "canonical": {},
+      "provenance": "splitter.py:132-135 (_LEGAL_TITLE_RE). Title class has U+2019, no ampersand.",
+      "vectors": [
+        { "input": "under the Divorce Act, s 15", "groups": {} },
+        { "input": "the Employees’ Retirement Act", "groups": {} },
+        { "input": "no instrument named", "groups": null }
+      ]
+    },
+    {
+      "id": "title.legal.toa",
+      "pattern": "(?<!\\w)(?:(?:and\\s+)?the\\s+)?[A-Z][A-Za-z'()& -]{1,100}?\\s+(?:Act|Code|Rules?|Regulations?|Convention|Treaty)(?=\\b|,)",
+      "flags": "",
+      "canonical": {},
+      "provenance": "toa_maker.py:101-104 (_LEGAL_TITLE_RE). Dialect vs splitter: gains ampersand, drops U+2019. Match spans differ across dialects on &-bearing and ’-bearing titles; the differential harness, not these vectors, asserts spans.",
+      "vectors": [
+        { "input": "under the Divorce Act, s 15", "groups": {} },
+        { "input": "the Trade & Commerce Act", "groups": {} }
+      ]
+    },
+    {
+      "id": "title.named-code",
+      "pattern": "\\b(?:Model\\s+)?(?:Code|Rules?)\\s+of\\s+[A-Z][A-Za-z'’ -]{2,100}",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:136-138 (_NAMED_CODE_RE). No toa counterpart.",
+      "vectors": [
+        { "input": "the Code of Professional Conduct requires", "groups": {} },
+        { "input": "Model Rules of Professional Conduct r 1.6", "groups": {} },
+        { "input": "a code of silence also matches under re.I — the lineage is recall-first here", "groups": {} },
+        { "input": "no such instrument", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.url",
+      "pattern": "\\b(?:https?://|www\\.)[^\\s<>]+|\\bperma\\.cc/[A-Z0-9-]+|\\bdoi:\\s*10\\.\\d{4,9}/\\S+",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:8-11 == toa_maker.py:82 (_URL_RE; compiled patterns identical). Source spells the flag as a leading (?i); hoisted to table flags.",
+      "vectors": [
+        { "input": "online: https://canlii.ca/t/1fqm7 accessed", "groups": {} },
+        { "input": "archived at perma.cc/ABC1-23DE", "groups": {} },
+        { "input": "doi: 10.1234/example.5678", "groups": {} },
+        { "input": "no link in this sentence", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.url.prefix",
+      "pattern": "(?:https?://|www\\.)",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "engine docx_linking.py:54 (URL_RE). Deliberately truncated prefix detector — routing only, no body match, no perma.cc/doi. Kept as its own entry because its purpose differs from cite.url.",
+      "vectors": [
+        { "input": "see www.canlii.org for the source", "groups": {} },
+        { "input": "wwwnot a link", "groups": null }
+      ]
+    },
+    {
+      "id": "frame.book",
+      "pattern": "\\([A-Z][A-Za-z .,'-]{1,50}:\\s*[^()]{0,80},?\\s*(?:17|18|19|20)\\d{2}\\)",
+      "flags": "",
+      "canonical": {},
+      "provenance": "splitter.py:35-37 (_BOOK_FRAME_RE): the (City: Publisher, Year) frame of a monograph citation.",
+      "vectors": [
+        { "input": "Peter Hogg, Constitutional Law of Canada (Toronto: Carswell, 2007) at 121", "groups": {} },
+        { "input": "(see the discussion below)", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.quoted",
+      "pattern": "[\"“][^\"”]{3,240}[\"”][^.;]{0,220}(?:\\b(?:17|18|19|20)\\d{2}\\b|\\b(?:online|perma\\.cc|doi)\\b)",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:123-127 (_QUOTED_CITATION_RE). Source spells the curly quotes as \\u201c/\\u201d escapes; written literal here.",
+      "vectors": [
+        { "input": "“The Duty to Consult” (2020) 43 Dal LJ 1", "groups": {} },
+        { "input": "\"short\" then nothing citation-like", "groups": null }
+      ]
+    },
+    {
+      "id": "cite.secondary",
+      "pattern": "(?<!\\w)[A-Z][^.;]{2,220}\\((?:[^()]|\\([^()]*\\)){0,160}(?:17|18|19|20)\\d{2}\\)(?:\\s*\\[[^\\]]+\\])?(?:\\s+at\\b|\\s*[,.;]|\\s*$)",
+      "flags": "",
+      "canonical": {},
+      "provenance": "splitter.py:128-131 (_SECONDARY_CITATION_RE): author-title-(parenthetical ending in year) shape for secondary sources.",
+      "vectors": [
+        { "input": "Ruth Sullivan, Sullivan on the Construction of Statutes (6th ed, 2014) at 45", "groups": {} },
+        { "input": "lowercase start (2014) never matches", "groups": null }
+      ]
+    }
+  ]
+}

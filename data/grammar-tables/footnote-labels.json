@@ -1,0 +1,99 @@
+{
+  "format": "beaver-grammar-table:v1",
+  "description": "Footnote label / marker grammars extracted VERBATIM from engine legalpdf/core.py (the PDF footnote-linking pass). Spelling follows the sources exactly: superscript digits, † ‡ § ¶ and ⟦ ⟧ are literal where the source writes them literally (_LABEL_RE/_PURE_LABEL_RE/_SUPER_RE/_INLINE_FN_RE), while _STANDALONE_REF_RE's \\u2020\\u2021\\u00a7\\u00b6 escapes and _DOUBLE_ZERO_WIDTH_RE's invisible \\u200b are kept as escapes exactly as the source spells them — a spelling dialect, not a semantic one. (?P<label> translated to JS syntax. Python compiles re.ASCII, JS without u. None of these carry re.I.",
+  "entries": [
+    {
+      "id": "label.line-start",
+      "pattern": "^\\s*(?<label>\\d{1,4}|[*†‡§¶#])(?:\\s|[.)\\],:;-])",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:33-35 (_LABEL_RE; (?P<label> translated to JS syntax, symbols literal in source). A footnote label at line start: 1-4 digits or a mark, then whitespace or closing punctuation. CanLII-style [N] bracket numbering does not match.",
+      "vectors": [
+        { "input": "38 Representation before a tribunal concerns legal rights.", "groups": { "label": "38" } },
+        { "input": "19. (1) An embedded statutory provision.", "groups": { "label": "19" } },
+        { "input": "* The author thanks the anonymous reviewers", "groups": { "label": "*" } },
+        { "input": "[2] Second paragraph contains enough ordinary decision prose to establish substantive structure.", "groups": null },
+        { "input": "12345 too many digits", "groups": null }
+      ]
+    },
+    {
+      "id": "label.pure",
+      "pattern": "^(?:\\d{1,4}|[*†‡§¶#])$",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:36 (_PURE_LABEL_RE, symbols literal in source). The whole string IS the label — no trailing punctuation, unlike label.line-start.",
+      "vectors": [
+        { "input": "12", "groups": {} },
+        { "input": "†", "groups": {} },
+        { "input": "12.", "groups": null },
+        { "input": "12345", "groups": null }
+      ]
+    },
+    {
+      "id": "label.superscript",
+      "pattern": "[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,4}",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:38 (_SUPER_RE). Superscript digits stay literal, as in the source; core.py:37 pairs this with _SUPER_TRANSLATION to map them to ASCII digits.",
+      "vectors": [
+        { "input": "Reasons¹²", "groups": {} },
+        { "input": "the court held.⁴", "groups": {} },
+        { "input": "⁰", "groups": {} },
+        { "input": "footnote 12 in plain digits", "groups": null }
+      ]
+    },
+    {
+      "id": "boundary.sentence.engine",
+      "pattern": "[.!?](?:[\"'”’)\\]]*)(?=\\s|⟦FN:|$)",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:39-41 (_SENTENCE_EDGE_RE). The ENGINE DIALECT of boundary.sentence.splitter (references.json): instead of looking forward to the next sentence's opener+capital, it consumes trailing closers (\" ' ” ’ ) ]) after the terminal punctuation and requires whitespace, a ⟦FN: marker, or end-of-text next. Source spells the straight quote \\\"; written literal (compiled-identical); ” ’ ⟦ literal in source.",
+      "vectors": [
+        { "input": "It was so held.” Next point.", "groups": {} },
+        { "input": "criminal liability. Depriving a person of liberty", "groups": {} },
+        { "input": "The proceeding ended.⟦FN:12⟧", "groups": {} },
+        { "input": "The end.", "groups": {} },
+        { "input": "R v X, 2020 SCC 1 at para.20", "groups": null }
+      ]
+    },
+    {
+      "id": "marker.inline-fn",
+      "pattern": "⟦FN:[^⟧]+⟧",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:42 (_INLINE_FN_RE) == adapters.py:99 (inline re.sub copy, byte-identical pattern). The engine's internal footnote-reference marker; ⟦ U+27E6 / ⟧ U+27E7 literal in both sources. Requires a non-empty id.",
+      "vectors": [
+        { "input": "The proceeding ended.⟦FN:12⟧ It resumed later.", "groups": {} },
+        { "input": "⟦FN:fn-003⟧", "groups": {} },
+        { "input": "⟦FN:⟧", "groups": null },
+        { "input": "a paragraph with no markers", "groups": null }
+      ]
+    },
+    {
+      "id": "label.standalone",
+      "pattern": "(?:\\d{1,4}|[*\\u2020\\u2021\\u00a7\\u00b6#])",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:50 (_STANDALONE_REF_RE). Same token shape as label.pure but unanchored (used against isolated reference-mark spans). The SOURCE spells † ‡ § ¶ as \\u2020\\u2021\\u00a7\\u00b6 escapes here (unlike _LABEL_RE's literals); kept exactly — the compiled characters are identical.",
+      "vectors": [
+        { "input": "7", "groups": {} },
+        { "input": "†", "groups": {} },
+        { "input": "¶", "groups": {} },
+        { "input": "no reference marks in this sentence", "groups": null }
+      ]
+    },
+    {
+      "id": "trap.double-zero-width",
+      "pattern": "\\u200b{2,}",
+      "flags": "",
+      "canonical": {},
+      "provenance": "engine core.py:51 (_DOUBLE_ZERO_WIDTH_RE). Two or more consecutive zero-width spaces — an extraction-defect tripwire. Invisible character stays a \\u200b escape, per the authoring rule and the source's own spelling. Vector inputs carry real U+200B characters (JSON-escaped for visibility).",
+      "vectors": [
+        { "input": "fn\u200b\u200b12", "groups": {} },
+        { "input": "\u200b\u200b\u200b", "groups": {} },
+        { "input": "fn\u200b12", "groups": null },
+        { "input": "clean text", "groups": null }
+      ]
+    }
+  ]
+}

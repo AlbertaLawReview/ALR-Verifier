@@ -1,0 +1,95 @@
+{
+  "format": "beaver-grammar-table:v1",
+  "description": "Pinpoint grammars (para/section/page with value sequences) extracted verbatim from the two lineages: the splitter dialect (ALR deterministic_splitter.py == engine deterministic_citations.py) and the toa_maker dialect. The defs mirror the source rf-string composition (_PIN_ITEM/_PIN_SEPARATOR/_PIN_SEQUENCE vs _PINPOINT_VALUE/_PINPOINT_LIST) so each fragment keeps one edit point. Dialects differ on: ranges inside an item (splitter) vs dash-as-list-separator (toa), 'to' as a separator (toa only), '&' as a separator (splitter only), pre-parenthesis space (splitter only), paragraph ¶ (splitter only), 'subsection' keyword (splitter only), and page-abbreviation period placement.",
+  "defs": {
+    "pin_item_splitter": "\\d+(?:\\.\\d+)*(?:\\s*\\([A-Za-z0-9]+\\))*(?:\\s*[-–]\\s*\\d+(?:\\.\\d+)*(?:\\s*\\([A-Za-z0-9]+\\))*)?",
+    "pin_sep_splitter": "(?:,\\s*(?:and|&)?\\s*|\\s+(?:and|&)\\s+)",
+    "pin_seq_splitter": "{{pin_item_splitter}}(?:\\s*{{pin_sep_splitter}}\\s*{{pin_item_splitter}})*",
+    "pin_item_toa": "\\d+(?:\\.\\d+)*(?:\\([A-Za-z0-9]+\\))*",
+    "pin_seq_toa": "{{pin_item_toa}}(?:\\s*(?:,|and|to|[-–—])\\s*{{pin_item_toa}})*"
+  },
+  "entries": [
+    {
+      "id": "pinpoint.para.splitter",
+      "pattern": "(?:\\bparas?(?:graphs?)?\\.?|¶)\\s*(?<values>{{pin_seq_splitter}})",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:87-89 (_PAR_PIN_RE). ¶ accepted; named group 'values' is in the source ((?P<values>) translated to JS syntax).",
+      "vectors": [
+        { "input": "Vavilov at paras 23, 27 and 31", "groups": { "values": "23, 27 and 31" } },
+        { "input": "see ¶ 12 above", "groups": { "values": "12" } },
+        { "input": "at Paras. 105", "groups": { "values": "105" } },
+        { "input": "at para 75", "groups": { "values": "75" } },
+        { "input": "at paras 23 to 27 — 'to' is not a separator in this dialect", "groups": { "values": "23" } },
+        { "input": "comparable paradigms", "groups": null }
+      ]
+    },
+    {
+      "id": "pinpoint.para.toa",
+      "pattern": "\\bparas?(?:graphs?)?\\.?\\s*(?<values>{{pin_seq_toa}})",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "toa_maker.py:145 (_PAR_RE). Dialect vs splitter: no ¶, 'to' and bare dashes join a list, ranges are separator-joined rather than item-internal. The source group is positional; named 'values' added (beaver) without changing match semantics.",
+      "vectors": [
+        { "input": "at paras 23 to 27", "groups": { "values": "23 to 27" } },
+        { "input": "at para 38", "groups": { "values": "38" } },
+        { "input": "see ¶ 12 above", "groups": null },
+        { "input": "comparable paradigms", "groups": null }
+      ]
+    },
+    {
+      "id": "pinpoint.section.splitter",
+      "pattern": "\\b(?:ss?\\.?|(?:sub)?sections?|rules?|rr?\\.?|articles?|arts?\\.?)\\s*(?<values>{{pin_seq_splitter}})",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:90-94 (_SEC_PIN_RE). Keyword set includes 'subsection'; named group in source.",
+      "vectors": [
+        { "input": "Ibid, s 49.2.", "groups": { "values": "49.2" } },
+        { "input": "DOLA, supra note 13, subsection 4(4).", "groups": { "values": "4(4)" } },
+        { "input": "ss 4-6 of the Act", "groups": { "values": "4-6" } },
+        { "input": "Ibid at art 1457.", "groups": { "values": "1457" } },
+        { "input": "the session resumed", "groups": null },
+        { "input": "les traités 12 pays (accented boundary keeps this clean)", "groups": null }
+      ]
+    },
+    {
+      "id": "pinpoint.section.toa",
+      "pattern": "\\b(?:s(?:ection)?s?|ss?\\.?|rules?|rr?\\.?|arts?\\.?|articles?)\\s*(?<values>{{pin_seq_toa}})",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "toa_maker.py:146-149 (_SECTION_RE). Dialect vs splitter: spells out s/section/sections, has no 'subsection'; positional group in source, named 'values' added (beaver).",
+      "vectors": [
+        { "input": "Ibid, s 49.2.", "groups": { "values": "49.2" } },
+        { "input": "s 672.54(a) applies", "groups": { "values": "672.54(a)" } },
+        { "input": "DOLA, supra note 13, subsection 4(4).", "groups": null },
+        { "input": "no provision named", "groups": null },
+        { "input": "les traités 12 pays (accented boundary keeps this clean)", "groups": null }
+      ]
+    },
+    {
+      "id": "pinpoint.page.splitter",
+      "pattern": "\\bat\\s+(?:(?:pp?\\.?|pages?)\\s+)?(?<values>{{pin_seq_splitter}})",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "splitter.py:95-98 (_PAGE_PIN_RE). Abbreviation period sits inside the alternation and a following space is mandatory; named group in source.",
+      "vectors": [
+        { "input": "Wills, supra note 2 at 826 [emphasis added].", "groups": { "values": "826" } },
+        { "input": "at pp. 5-7", "groups": { "values": "5-7" } },
+        { "input": "at p.5 — no space after the period fails this dialect", "groups": null },
+        { "input": "we met at noon", "groups": null }
+      ]
+    },
+    {
+      "id": "pinpoint.page.toa",
+      "pattern": "\\bat\\s+(?:(?:pp?|pages?)\\.?\\s*)?(?<values>{{pin_seq_toa}})",
+      "flags": "i",
+      "canonical": {},
+      "provenance": "toa_maker.py:150 (_PAGE_RE). Dialect vs splitter: period after the alternation and the following space optional, so 'at p.5' matches here only; positional group in source, named 'values' added (beaver).",
+      "vectors": [
+        { "input": "Wills, supra note 2 at 826 [emphasis added].", "groups": { "values": "826" } },
+        { "input": "at p.5 works in this dialect", "groups": { "values": "5" } },
+        { "input": "we met at noon", "groups": null }
+      ]
+    }
+  ]
+}

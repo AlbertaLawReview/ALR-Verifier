@@ -469,6 +469,127 @@ class A2AJScopeResolutionTests(unittest.TestCase):
 
 
 class LawStructureRegressionTests(unittest.TestCase):
+    def test_dot_terminated_statute_family_is_a_separate_fallback(self):
+        body = (
+            " This section provides for administration of the enactment "
+            "throughout the territory."
+        )
+        text = "\n".join((
+            "1. There is established a board." + body,
+            "2.(1) In this section, a term has its prescribed meaning." + body,
+            "2.1. This inserted provision also governs administration." + body,
+            "3. The Minister may make regulations." + body,
+            "4. This Act comes into force on assent." + body,
+        ))
+        structure = a2aj_structure.analyze(text, "law")
+        self.assertEqual(
+            ["sec1", "sec2", "sec2(1)", "sec2.1", "sec3", "sec4"],
+            [block[1] for block in structure["blocks"]],
+        )
+
+    def test_emphasized_alpha_regulation_sections_are_preserved(self):
+        text = "\n".join((
+            "**A.01.001** First provision.",
+            "**A.01.002** Second provision.",
+            "**A.01.003** Third provision.",
+        ))
+        self.assertEqual(
+            ["A.01.001", "A.01.002", "A.01.003"],
+            [
+                section[0]
+                for section in a2aj_structure.section_structure(text)
+            ],
+        )
+
+    def test_single_emphasized_provision_keeps_inline_and_decimal_children(self):
+        text = "\n".join((
+            "**231** (1) First subsection.",
+            "(6.01) Earlier decimal subsection.",
+            "(6.1) Later decimal subsection.",
+            "(a) Paragraph under the later subsection.",
+        ))
+        self.assertEqual(
+            [
+                "sec231",
+                "sec231(1)",
+                "sec231(6.01)",
+                "sec231(6.1)",
+                "sec231(6.1)(a)",
+            ],
+            [
+                block[1]
+                for block in a2aj_structure.legislation_blocks(text)
+            ],
+        )
+
+    def test_wrapped_markdown_range_end_is_not_a_section(self):
+        text = "\n".join((
+            "### Interpretation of Sections 85AA to",
+            "85F",
+            "85AA First provision in the range.",
+            "85AB Second provision in the range.",
+            "86 Provision after the range.",
+        ))
+        self.assertEqual(
+            ["85AA", "85AB", "86"],
+            [
+                section[0]
+                for section in a2aj_structure.section_structure(text)
+            ],
+        )
+
+    def test_short_root_line_broken_quantity_is_refused(self):
+        text = "\n".join((
+            "1",
+            "Short title",
+            "The instrument text follows.",
+            "2",
+            "de 45,72 litres",
+        ))
+        self.assertEqual([], a2aj_structure.section_structure(text))
+
+    def test_wrapped_plan_numbers_do_not_break_a_short_section_spine(self):
+        text = "\n".join((
+            "1 The first provision refers to a survey (plan",
+            "10357 AATC) and then continues with operative text.",
+            "2 The second provision refers to another survey (plan",
+            "10357 AATC) and then continues with operative text.",
+            "3 The final provision completes the instrument.",
+        ))
+        self.assertEqual(
+            ["1", "2", "3"],
+            [
+                section[0]
+                for section in a2aj_structure.section_structure(text)
+            ],
+        )
+
+    def test_two_section_instrument_is_bounded(self):
+        text = "\n".join((
+            "1 This Act may be cited as the Short Act.",
+            "2 Distinctive commencement provision.",
+        ))
+        sections = a2aj_structure.section_structure(text)
+        self.assertEqual(["1", "2"], [section[0] for section in sections])
+        self.assertNotIn("Distinctive", sections[0][3])
+        self.assertIn("Distinctive", sections[1][3])
+
+    def test_status_range_exposes_each_locator_without_copying_text(self):
+        text = "\n".join((
+            "1 First provision.",
+            "2 Second provision.",
+            "3 Third provision.",
+            "4 Fourth provision.",
+            "**5 to 18** [Repealed]",
+            "19 Nineteenth provision.",
+            "20 Twentieth provision.",
+            "21 Final provision.",
+        ))
+        structure = a2aj_structure.analyze(text, "law")
+        by_label = {block[1]: block for block in structure["blocks"]}
+        self.assertIn("sec12", by_label)
+        self.assertEqual(by_label["sec5"][2:], by_label["sec12"][2:])
+
     def test_integer_spine_preserves_dotted_top_level_provisions(self):
         quote = "significant threat to the safety of the public"
         text = "\n".join((
@@ -529,6 +650,57 @@ class LawStructureRegressionTests(unittest.TestCase):
 
 
 class ParagraphStructureRegressionTests(unittest.TestCase):
+    def test_complete_short_bracket_ladder_is_accepted(self):
+        text = "\n".join((
+            "COURT OF APPEAL — Costs ruling. Registry 12345.",
+            "[1] The appellant seeks costs of the application on an elevated scale, arguing the respondent's conduct through the proceeding unnecessarily lengthened the hearing and multiplied expense for every party involved in the litigation.",
+            "[2] We do not agree that the conduct rises to the level required for elevated costs under the governing authorities.",
+            "[3] The application is dismissed with costs in the ordinary course.",
+        ))
+        self.assertEqual(
+            [1, 2, 3],
+            [item[0] for item in a2aj_structure.paragraph_index(text)],
+        )
+
+    def test_short_bracket_ladder_cannot_be_a_long_document_tail(self):
+        text = (
+            "Reasons continue at considerable length here. " * 500
+            + "\n[1] Tail list item one with enough words to look superficially substantive."
+            + "\n[2] Tail list item two with enough words to look superficially substantive."
+        )
+        self.assertEqual([], a2aj_structure.paragraph_index(text))
+
+    def test_heading_joined_missing_paragraph_is_recovered(self):
+        body = (
+            "The court sets out the governing legal principles and applies "
+            "them to the record using enough substantive words."
+        )
+        text = "\n".join((
+            f"[1] {body}",
+            f"[2] {body}",
+            f"(a) Qualified Privilege [3] {body}",
+            f"[4] {body}",
+            f"[5] {body}",
+            f"[6] {body}",
+        ))
+        result = a2aj_structure.paragraph_index(text)
+        self.assertEqual([1, 2, 3, 4, 5, 6], [item[0] for item in result])
+        self.assertTrue(result[2][3].startswith("[3] The court"))
+
+    def test_short_concurrence_tail_does_not_sink_real_reasons(self):
+        text = "\n".join((
+            "[1] The trial judge erred in principle by treating the limitation defence as dispositive without first resolving the discoverability question that both parties squarely raised on the evidence presented at trial in this matter before the court.",
+            "[2] I would allow the appeal.",
+            "[3] SMITH J.A.: I agree.",
+            "[4] JONES J.A.: I agree.",
+            "[5] LOW J.A.: I agree.",
+            "[6] Disposition accordingly.",
+        ))
+        self.assertEqual(
+            list(range(1, 7)),
+            [item[0] for item in a2aj_structure.paragraph_index(text)],
+        )
+
     def test_embedded_numbered_list_cannot_borrow_an_unnumbered_tail(self):
         prefix = "Reasons before the quoted list. " * 100
         numbered_list = "\n".join(
@@ -742,7 +914,7 @@ class QuoteCheckIntegrationTests(unittest.TestCase):
             name="Criminal Code",
             date="",
             url="",
-            text="unstructured fallback",
+            text="",
             language="en",
             scraped_timestamp="",
             upstream_license="",
@@ -792,7 +964,10 @@ class QuoteCheckIntegrationTests(unittest.TestCase):
             name="Criminal Code",
             date="",
             url="https://laws-lois.justice.gc.ca/eng/XML/C-46.xml",
-            text="an intentionally unstructured full instrument",
+            text=(
+                "16 The defence of mental disorder applies in stated circumstances.\n"
+                f"672.54 The accused is not a {quote}."
+            ),
             language="en",
             scraped_timestamp="",
             upstream_license="",
@@ -841,6 +1016,76 @@ class QuoteCheckIntegrationTests(unittest.TestCase):
         )
         self.assertIn("#sec672.54:~:text=", fragment_link)
         self.assertIn("significant%20threat", fragment_link)
+
+    def test_section_map_cannot_replace_or_relabel_conflicting_full_text(self):
+        document = verifier.a2aj_client.A2AJDocument(
+            dataset="LEGISLATION-FED",
+            citation="RSC 1985, c C-46",
+            alternate_citation="C-46",
+            name="Criminal Code",
+            date="",
+            url="",
+            text=(
+                "4 The complete instrument text remains authoritative.\n"
+                "5 The next provision confirms the numbering spine.\n"
+                "6 The final provision completes the numbering spine."
+            ),
+            language="en",
+            scraped_timestamp="",
+            upstream_license="",
+            raw={
+                "unofficial_sections_en": json.dumps({
+                    "99": "99 Provider text that is absent from the instrument.",
+                })
+            },
+        )
+
+        text, structure = verifier._a2aj_document_evidence(document, "law")
+
+        self.assertEqual(text, document.text)
+        self.assertEqual(structure["source"] if "source" in structure else "", "")
+        self.assertEqual(
+            {block[1] for block in structure["blocks"]},
+            {"sec4", "sec5", "sec6"},
+        )
+
+    def test_complete_section_map_excludes_amendment_text_numbering(self):
+        text = "\n".join((
+            "1 The first provision enacts the measure.",
+            "2 The second provision states its application.",
+            "3 The third provision contains commencement.",
+            "10 Amended Act provision copied into the schedule.",
+            "11 Another copied amendment provision.",
+            "12 Final copied amendment provision.",
+        ))
+        document = verifier.a2aj_client.A2AJDocument(
+            dataset="LEGISLATION-AB",
+            citation="SA 2026, c 1",
+            alternate_citation="",
+            name="Example Act",
+            date="",
+            url="",
+            text=text,
+            language="en",
+            scraped_timestamp="",
+            upstream_license="",
+            raw={
+                "unofficial_sections_en": json.dumps({
+                    "1": text.splitlines()[0],
+                    "2": text.splitlines()[1],
+                    "3": text.splitlines()[2],
+                })
+            },
+        )
+
+        rendition, structure = verifier._a2aj_mapped_law_evidence(document)
+
+        self.assertEqual(rendition, text)
+        self.assertEqual(structure["source"], "section_map")
+        self.assertEqual(
+            {block[1] for block in structure["blocks"]},
+            {"sec1", "sec2", "sec3"},
+        )
 
     def test_wrong_law_section_full_document_match_links_at_unknown(self):
         law_base = (

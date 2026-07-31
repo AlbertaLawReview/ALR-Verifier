@@ -34,12 +34,12 @@ source .venv/bin/activate. Add or drag one or more DOCX files into the window,
 choose the settings, and press Run. Review workbooks are written to
 CHECKED_EDITS by default.
 
-PDF intake is experimental. It uses a deterministic PyMuPDF module for native
-text and footnote pairing. Enable it
-under **Settings → Advanced → Enable experimental PDF input**. PDFs with
-unusual layouts should be reviewed carefully. This mode supports
-bottom-of-page footnotes whose references are on the same page; it does not
-support endnotes.
+PDF intake is experimental. It uses the deterministic legal-PDF engine for
+native text, page structure, footnotes, endnotes, and cross-page note bodies.
+Enable it under **Settings → Advanced → Enable experimental PDF input**.
+Scanned PDFs use Tesseract OCR when it is installed; set
+`LEGALPDF_TESSERACT_COMMAND` if the executable is outside a standard location.
+OCR and unusual layouts should be reviewed carefully.
 
 An OpenAI API key is required for modes that use AI. Enter it when prompted or
 set OPENAI_API_KEY. A key entered in the Windows application is encrypted for
@@ -74,9 +74,17 @@ the applicable service terms. Review each service's current privacy and data
 retention policies yourself.
 
 The **A2AJ local corpus** panel can install the complete case-law and
-legislation datasets. As of July 2026, that is about 5 GB of storage. This allows rapid local processing. 
-Once you have this downloaded, you can turn on the **Local only** setting to verify documents 
-100% locally/offline.
+legislation datasets for faster local-first lookups. It checks upstream
+partition metadata for staleness, resumes interrupted downloads, and reuses
+byte-identical partitions. If an upstream Parquet file was merely serialized in
+a different row order, the update retains the existing local file after
+verifying that its rows are unchanged. Stable multi-file dataset partitions are
+also supported so upstream publishers can add shards without replacing prior
+ones. The separate **Local only** setting requires that complete corpus and
+prevents verification runs from making network requests; journal retrieval and
+the bundled reference database are already local. Installing or updating the
+corpus is an explicit network operation and currently requires about 4.9 GB of
+storage.
 
 ## Windows package
 

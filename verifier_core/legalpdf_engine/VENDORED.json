@@ -1,0 +1,25 @@
+{
+  "source": "universal-legal-pdf-engine",
+  "commit": "51d51c49b6bb6f378d17ca2083e4a161636a3e9b",
+  "files": {
+    "adapters.py": "8cfa3018be763e03c90f496587630588c8f6ba59c8a92a2cf10f295760a1fdf2",
+    "anchored_scan.py": "d0aa1ebac6f1540d993fa68e81010d781cae45f710a089278b48b40b7d316d23",
+    "column_order_arbiter.py": "dc18ed22e50c8bc2158a18519304ba6bf535c2287b90210196986a068b7200a9",
+    "core.py": "5a392501d7f25d3c4c45a26f8c6ab0f9c2079b3ba5f84d2a770e2fe0a7b560eb",
+    "data/mcgill_reporters.json": "6c5aa7b0b826e0842ff0631de40ee8457cb5e948eb120e7568686489703b57d7",
+    "footnote_pairing.py": "3a35930e022778741618239658ab426771a98684355529bc9ad90f8863cd554b",
+    "footnote_pairing_support.py": "0d6d7812086f8f0b958aa240fd3f0354d8a1d5a3a7b7ab42ed68c83f36207368",
+    "footnote_separator_scan.py": "a548b3b487668ce04f3d271f189a359d8274caca985420d7482afa6d952df691",
+    "grammar_tables.py": "d7c40f46641e4e8c612dee29320f31127d075261fe37ff793cd9e67b39e23131",
+    "model.py": "3e3c20021711412e0e3370f21e8ebf778a764d887e0ae6bef903ade0e209de95",
+    "note_crossrefs.py": "d349067ff61aeb44104b48ff21d485916b744dff4731ee4a1f522419a2ef9c81",
+    "ocr.py": "baa12046e7ed7065c0cdd1acfc9d8f1968060c24a8f164c21041c1d7f29301c0",
+    "superscript_splice.py": "f169ede0bc29165b91d1a746e260c6c6034bc8b3119f53894ce1b95021cae5a5"
+  },
+  "grammar_tables": {
+    "citations.json": "51675b8eb94ff067c62103c271a2a7a7d91de551df4b39bead9bcf9c14359560",
+    "footnote-labels.json": "bf283283ddaf4d5b8c9c42c94ef1d78c4b8ace93eb50f2ad2c69163dcf55ec19",
+    "pinpoints.json": "8801cef918ad82a83fdbb6bd0b95b205a9fcd49e25f5b89a0393ef1b11c5a42d",
+    "references.json": "b42f38fea7ed4c66272d0d09d33df5176744e2db92674d393cfb649a132e22d4"
+  }
+}

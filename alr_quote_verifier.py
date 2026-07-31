@@ -2839,10 +2839,35 @@ _A2AJ_LOCKED_STRUCTURES: Dict[str, Dict[str, Any]] = {}
 _A2AJ_LOCKED_TEXTS: Dict[str, str] = {}
 
 
+def _unique_a2aj_word_span(
+    text: str,
+    words: List[str],
+) -> Optional[Tuple[int, int]]:
+    """Find one exact word sequence in one already-bounded provision."""
+    if not text or not words:
+        return None
+    spans = _text_fragment_word_spans(text)
+    wanted = [word.casefold() for word in words]
+    candidates: List[Tuple[int, int]] = []
+    width = len(wanted)
+    for index, (word, start, _end) in enumerate(spans):
+        if word.casefold() != wanted[0] or index + width > len(spans):
+            continue
+        if [
+            candidate.casefold()
+            for candidate, _start, _end in spans[index:index + width]
+        ] != wanted:
+            continue
+        candidates.append((start, spans[index + width - 1][2]))
+        if len(candidates) == 2:
+            return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _a2aj_mapped_law_evidence(
     document: a2aj_client.A2AJDocument,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Build exact law blocks from the local corpus's authoritative section map."""
+    """Overlay exact provider sections without replacing the full instrument."""
     raw_sections = document.raw.get(f"unofficial_sections_{document.language}")
     if isinstance(raw_sections, str):
         try:
@@ -2852,20 +2877,193 @@ def _a2aj_mapped_law_evidence(
     if not isinstance(raw_sections, dict):
         return "", {}
 
+    entries: List[Tuple[str, str]] = []
+    for raw_label, raw_text in raw_sections.items():
+        label = str(raw_label or "").strip()
+        section_text = _normalize_a2aj_source_text(str(raw_text or ""))
+        if label and section_text.strip() and section_text.strip().casefold() != "[blank]":
+            entries.append((label, section_text))
+    if not entries:
+        return "", {}
+
+    full_text = _normalize_a2aj_source_text(str(document.text or ""))
+    if full_text.strip():
+        ordered_entries = _a2aj_structure.ordered_section_map_entries(entries)
+        direct_entries = [
+            (label, section_text)
+            for label, section_text in ordered_entries
+            if _a2aj_structure.PROVISION_LABEL_RE.fullmatch(label)
+        ]
+        aligned: List[Tuple[str, str, int]] = []
+        cursor = 0
+        for label, section_text in direct_entries:
+            found = full_text.find(section_text, cursor)
+            if found < 0:
+                aligned = []
+                break
+            aligned.append((label, section_text, found))
+            cursor = found + len(section_text)
+        if direct_entries and len(aligned) == len(direct_entries):
+            blocks: List[Tuple[str, str, int, int]] = []
+            for label, section_text, start in aligned:
+                blocks.extend(
+                    _a2aj_structure.single_section_blocks(
+                        section_text,
+                        label,
+                        start=start,
+                    )
+                )
+            return full_text, {
+                "status": "usable",
+                "type": "section",
+                "source": "section_map",
+                "blocks": blocks,
+                "count": len(direct_entries),
+            }
+
+        reconstructed = _a2aj_structure.analyze(
+            full_text,
+            "law",
+            document.citation,
+            document.alternate_citation,
+            document.dataset,
+            document.name,
+        )
+        blocks = list(reconstructed.get("blocks") or [])
+        overlaid = 0
+        direct_labels = {
+            label.casefold()
+            for label, _section_text in entries
+            if _a2aj_structure.PROVISION_LABEL_RE.fullmatch(label)
+        }
+        mapped_labels = {
+            mapped.casefold()
+            for label, _section_text in entries
+            for mapped in _a2aj_structure.provision_labels_from_map_key(label)
+        }
+        overlaid_labels: set[str] = set()
+        label_counts: Dict[str, int] = {}
+        for label, _section_text in entries:
+            key = label.casefold()
+            label_counts[key] = label_counts.get(key, 0) + 1
+
+        for label, section_text in entries:
+            if (
+                label_counts[label.casefold()] != 1
+                or not _a2aj_structure.PROVISION_LABEL_RE.fullmatch(label)
+            ):
+                continue
+            locator = f"sec{label}"
+            roots = [
+                (index, block)
+                for index, block in enumerate(blocks)
+                if str(block[1]).casefold() == locator.casefold()
+            ]
+            if len(roots) > 1:
+                continue
+            if roots:
+                _index, (_section, _locator, start, end) = roots[0]
+                root_text = full_text[start:end]
+                local_start = root_text.find(section_text)
+                exact = (
+                    local_start >= 0
+                    and root_text.find(section_text, local_start + 1) < 0
+                )
+                if exact:
+                    exact_start = start + local_start
+                    exact_end = exact_start + len(section_text)
+                    match_start, match_end = exact_start, exact_end
+                else:
+                    provider_words = [
+                        word
+                        for word, _start, _end in _text_fragment_word_spans(
+                            section_text
+                        )
+                    ]
+                    bounded = _unique_a2aj_word_span(root_text, provider_words)
+                    if bounded is None:
+                        continue
+                    exact_start = exact_end = -1
+                    match_start, match_end = (
+                        start + bounded[0],
+                        start + bounded[1],
+                    )
+            else:
+                exact_start = full_text.find(section_text)
+                exact = (
+                    exact_start >= 0
+                    and full_text.find(section_text, exact_start + 1) < 0
+                )
+                if not exact:
+                    continue
+                exact_end = exact_start + len(section_text)
+                match_start, match_end = exact_start, exact_end
+            if roots:
+                _index, (_section, _locator, start, end) = roots[0]
+                if match_start < start or match_end > end:
+                    continue
+                if exact:
+                    blocks = [
+                        block
+                        for block in blocks
+                        if not (
+                            str(block[1]).casefold().startswith(
+                                locator.casefold() + "("
+                            )
+                            and block[2] >= start
+                            and block[3] <= end
+                        )
+                    ]
+                    blocks.extend(
+                        _a2aj_structure.single_section_blocks(
+                            section_text, label, start=exact_start
+                        )[1:]
+                    )
+                overlaid += 1
+                overlaid_labels.add(label.casefold())
+                continue
+            if exact:
+                blocks.extend(
+                    _a2aj_structure.single_section_blocks(
+                        section_text, label, start=exact_start
+                    )
+                )
+                overlaid += 1
+                overlaid_labels.add(label.casefold())
+
+        if direct_labels and overlaid_labels == direct_labels:
+            blocks = [
+                block
+                for block in blocks
+                if str(block[0]).casefold() in mapped_labels
+            ]
+        blocks.sort(key=lambda block: (block[2], "(" in str(block[1])))
+        roots = {
+            str(locator).casefold()
+            for _section, locator, _start, _end in blocks
+            if "(" not in str(locator)
+        }
+        return full_text, {
+            "status": "usable" if roots else "unavailable",
+            "type": "section" if roots else "",
+            "source": "section_map" if roots and overlaid else "",
+            "blocks": blocks,
+            "count": len(roots),
+        }
+
+    # Some providers supply only a section map. In that case its assembled
+    # rendition is the whole document, so its exact offsets remain authoritative.
     pieces: List[str] = []
     blocks: List[Tuple[str, str, int, int]] = []
     position = 0
     section_count = 0
-    for raw_label, raw_text in raw_sections.items():
-        label = str(raw_label or "").strip()
-        section_text = _normalize_a2aj_source_text(str(raw_text or "")).strip()
-        if not section_text:
-            continue
+    for label, section_text in _a2aj_structure.ordered_section_map_entries(entries):
+        section_text = section_text.strip()
         if pieces:
             pieces.append("\n")
             position += 1
         pieces.append(section_text)
-        if re.fullmatch(r"\d{1,8}(?:[.-]\d{1,8}){0,3}", label):
+        if _a2aj_structure.PROVISION_LABEL_RE.fullmatch(label):
             blocks.extend(
                 _a2aj_structure.single_section_blocks(
                     section_text, label, start=position
@@ -2889,7 +3087,7 @@ def _a2aj_document_evidence(
 ) -> Tuple[str, Dict[str, Any]]:
     if source_kind == "law":
         mapped_text, mapped_structure = _a2aj_mapped_law_evidence(document)
-        if mapped_text:
+        if mapped_text and mapped_structure.get("status") == "usable":
             return mapped_text, mapped_structure
 
     text = _normalized_a2aj_document_text(document, source_kind)
