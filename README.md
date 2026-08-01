@@ -11,6 +11,10 @@ This saves enormous time in the law review editing process, and may assist other
 endeavours as well. An experimental feature allows analysis of PDFs which would, for example,
 allow a lawyer to quickly review the sources in an opposing litigant's brief.
 
+<p align="center">
+  <a href="https://github.com/AlbertaLawReview/ALR-Verifier/releases/latest"><img src="https://img.shields.io/badge/Download%20for%20Windows-ALR%20Quote%20Verifier-2ea44f?style=for-the-badge" alt="Download ALR Quote Verifier"></a>
+</p>
+
 ## Quick start for Windows
 
 For non-technical users:
@@ -25,11 +29,6 @@ For non-technical users:
 ## Example workbook
 
 ![Generated workbook showing a checked quotation marked Perfect Match](https://raw.githubusercontent.com/AlbertaLawReview/ALR-Verifier/main/assets/workbook-example.png)
-## Download details
-
-Download the latest ZIP and its SHA-256 checksum from the
-[GitHub releases page](https://github.com/AlbertaLawReview/ALR-Verifier/releases/latest).
-Keep the files together and verify the checksum before running the application.
 
 ## Run from source (technical)
 
@@ -102,25 +101,12 @@ disk space while the local SQLite runtime is built. The corpus feature is
 included in the normal application and source installation; no separate
 importer setup is needed.
 
-## Windows package
-
-The downloadable Windows package contains ALR Quote Verifier.exe, the
-Alberta Law Review journal database, the project licence, applicable upstream
-notices, and a SHA-256 checksum. The executable is digitally signed.
-
 ## Test
 
     python -m pip install -r requirements.txt pytest
     python -X utf8 -m pytest tests -q
 
 CI runs the test suite on Windows, macOS, and Linux with Python 3.11.
-
-### PDF parsing
-
-The legal-PDF parser is included directly in this repository as a fixed,
-self-contained snapshot. The application uses that copy directly; normal
-clones, tests, and builds do not require another engine checkout or a sync
-step.
 
 ## Key contributors
 
