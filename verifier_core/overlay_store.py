@@ -20,6 +20,8 @@ At runtime, db_path(name) copies the entry once into
 keyed, so upgrades extract fresh and stale versions are swept) and returns
 that path on every later call without touching the overlay again.
 
+macOS onedir app bundles keep the same files as ordinary Resources instead
+of using this overlay; callers keep their ``_MEIPASS`` fallback there.
 Source checkouts use repo-relative data paths.
 """
 from __future__ import annotations

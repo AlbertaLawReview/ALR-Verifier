@@ -82,6 +82,8 @@ HL_DIM = "#8DA096"          # highlights: secondary text / idle hint
 
 
 def _default_output_folder() -> str:
+    if getattr(sys, "frozen", False) and sys.platform == "darwin":
+        return str(paths.data_dir() / "CHECKED_EDITS")
     return str(_app_dir() / "CHECKED_EDITS")
 
 
@@ -2211,7 +2213,11 @@ class ALRQuoteVerifierGUI:
 
     def _a2aj_corpus_installed(self) -> bool:
         corpus = aqv.a2aj_client.get_local_corpus()
-        return all(status.installed for status in self._a2aj_statuses()) and corpus.runtime_ready()
+        return self._a2aj_source_installed() and corpus.runtime_ready()
+
+    def _a2aj_source_installed(self) -> bool:
+        """Whether both downloaded source snapshots are complete."""
+        return all(status.installed for status in self._a2aj_statuses())
 
     @staticmethod
     def _format_gb(size: int) -> str:
@@ -2220,6 +2226,7 @@ class ALRQuoteVerifierGUI:
     def _refresh_a2aj_corpus_ui(self, remote_statuses=None, message=""):
         statuses = self._a2aj_statuses()
         installed = self._a2aj_corpus_installed()
+        source_installed = all(status.installed for status in statuses)
         size = sum(status.size for status in statuses)
         if message:
             label = message
@@ -2228,8 +2235,10 @@ class ALRQuoteVerifierGUI:
             label = f"Installed · {self._format_gb(size)}"
             if stale:
                 label += " · update available"
+        elif source_installed:
+            label = "Downloaded · preparing local index"
         elif any(status.installed for status in statuses):
-            label = "Partly installed · resume to finish"
+            label = "Partly downloaded · resume to finish"
         else:
             label = "Not installed · approximately 4.9 GB"
         self.a2aj_corpus_status_var.set(label)
@@ -2243,8 +2252,8 @@ class ALRQuoteVerifierGUI:
                     else lambda: self._check_a2aj_updates(manual=True)
                 )
             else:
-                button_text = "Install…"
-                button_command = self._install_or_cancel_a2aj
+                button_text = "Prepare local index…" if source_installed else "Install…"
+                button_command = self._start_a2aj_install if source_installed else self._install_or_cancel_a2aj
             self.a2aj_corpus_btn.config(
                 text=button_text,
                 command=button_command,
@@ -2259,7 +2268,7 @@ class ALRQuoteVerifierGUI:
             return
         if not manual and self.local_only_var.get():
             return
-        if not self._a2aj_corpus_installed():
+        if not self._a2aj_source_installed():
             return
         self._a2aj_checking = True
         self.a2aj_corpus_status_var.set("Checking for updates…")
@@ -2366,7 +2375,7 @@ class ALRQuoteVerifierGUI:
     def _start_a2aj_install(self, enable_local_only=False, confirmed=False):
         if self._a2aj_installing:
             return
-        if not self._a2aj_corpus_installed() and not confirmed:
+        if not self._a2aj_source_installed() and not confirmed:
             if not self._offer_local_corpus_install():
                 return
         self._a2aj_installing = True

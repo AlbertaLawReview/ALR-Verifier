@@ -20,7 +20,7 @@ For non-technical users:
 3. Double-click **ALR Quote Verifier.exe**.
 4. If Windows shows **Windows protected your PC**, click **More info** and then **Run anyway** only if you downloaded this release from this page and the app name is correct. If Defender reports a virus or other threat, cancel and do not run it.
 5. Use **Add files** to select your Word `.docx` files, choose your settings, and press **Run**. Finished Excel workbooks are written to the `CHECKED_EDITS` folder.
-6. Modes that use AI ask for your OpenAI API key. OpenAI bills that usage under your account. **Free** mode makes no AI calls.
+6. Modes that use AI ask for your OpenAI API key. The app includes a **First-time setup guide** and a masked **Set key** dialog, so you can follow the setup inside the software; you do not need to edit files or use the command line. The key is encrypted for your Windows account. OpenAI bills usage under your account. **Free** mode makes no AI calls.
 
 ## Example workbook
 
@@ -96,10 +96,11 @@ unchanged partitions. After a download it atomically builds the shared SQLite
 runtime used for every lookup. The separate **Local only** setting requires
 that complete corpus and prevents verification runs from making network
 requests; journal retrieval and the bundled reference database are already
-local. Installing or updating the corpus is an explicit network operation and
-currently requires about 4.9 GB of storage. The corpus feature is included in
-the normal application and source installation; no separate importer setup is
-needed.
+local. Installing or updating the corpus is an explicit network operation. It
+downloads about 4.9 GB compressed and requires approximately 10 GB of free
+disk space while the local SQLite runtime is built. The corpus feature is
+included in the normal application and source installation; no separate
+importer setup is needed.
 
 ## Windows package
 

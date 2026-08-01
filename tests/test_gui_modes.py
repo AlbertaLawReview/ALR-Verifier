@@ -298,6 +298,37 @@ def test_a2aj_corpus_button_routes_check_and_update_separately():
     assert button.config.call_args.kwargs["command"] is install
 
 
+def test_downloaded_corpus_without_runtime_offers_index_preparation():
+    statuses = tuple(
+        SimpleNamespace(installed=True, size=10, stale=False)
+        for _ in range(2)
+    )
+    prepare = Mock()
+    button = Mock()
+    stub = SimpleNamespace(
+        _a2aj_statuses=lambda: statuses,
+        _a2aj_corpus_installed=lambda: False,
+        _a2aj_installing=False,
+        _a2aj_source_installed=lambda: True,
+        local_only_var=SimpleNamespace(get=lambda: False),
+        a2aj_corpus_btn=button,
+        a2aj_corpus_status_var=Mock(),
+        _format_gb=lambda size: str(size),
+        _start_a2aj_install=prepare,
+        _install_or_cancel_a2aj=Mock(),
+        _apply_local_only_ui=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._refresh_a2aj_corpus_ui(stub)
+
+    stub.a2aj_corpus_status_var.set.assert_called_once_with(
+        "Downloaded · preparing local index"
+    )
+    assert button.config.call_args.kwargs["text"] == "Prepare local index…"
+    button.config.call_args.kwargs["command"]()
+    prepare.assert_called_once_with()
+
+
 def test_manual_a2aj_update_check_works_in_local_only_and_shows_busy_state():
     corpus = Mock()
     corpus.check_for_updates.side_effect = ["cases", "laws"]
@@ -306,6 +337,7 @@ def test_manual_a2aj_update_check_works_in_local_only_and_shows_busy_state():
         _a2aj_checking=False,
         local_only_var=SimpleNamespace(get=lambda: True),
         _a2aj_corpus_installed=lambda: True,
+        _a2aj_source_installed=lambda: True,
         a2aj_corpus_btn=Mock(),
         a2aj_corpus_status_var=Mock(),
         root=SimpleNamespace(after=Mock()),
@@ -389,6 +421,7 @@ def test_a2aj_install_clears_cache_after_each_completed_corpus():
     stub = SimpleNamespace(
         _a2aj_installing=False,
         _a2aj_corpus_installed=lambda: True,
+        _a2aj_source_installed=lambda: True,
         _a2aj_cancel=cancel,
         _install_or_cancel_a2aj=Mock(),
         a2aj_corpus_btn=Mock(),
@@ -453,3 +486,10 @@ def test_process_log_hook_redirects_windowed_output(tmp_path):
             stream.close()
 
     assert destination.read_text(encoding="utf-8") == "packaged progress\n"
+
+
+def test_frozen_macos_uses_writable_appdata_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(gui.sys, "platform", "darwin")
+    monkeypatch.setattr(gui.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(gui.paths, "data_dir", lambda: tmp_path)
+    assert gui._default_output_folder() == str(tmp_path / "CHECKED_EDITS")

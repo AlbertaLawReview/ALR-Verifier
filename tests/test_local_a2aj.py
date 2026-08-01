@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -204,6 +205,45 @@ def test_resumes_partial_download(tmp_path):
     assert destination.read_bytes() == content
 
 
+def test_install_downloads_and_verifies_a_partition(tmp_path):
+    content = b"downloaded parquet bytes"
+
+    class Response:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, size):
+            yield content
+
+    class Session:
+        def get(self, url, **kwargs):
+            assert "/resolve/revision/SCC/train.parquet" in url
+            assert kwargs["stream"] is True
+            assert kwargs["headers"] == {}
+            return Response()
+
+    item = CorpusFile(
+        "SCC/train.parquet", hashlib.sha256(content).hexdigest(), len(content)
+    )
+    remote = RemoteSnapshot("cases", "a2aj/test", "revision", "today", (item,))
+    corpus = LocalA2AJCorpus(tmp_path / "corpus", Session())
+
+    status = corpus.install_or_update(
+        "cases", remote=remote, rebuild_runtime=False
+    )
+
+    assert status.installed is True
+    assert (corpus.root / "cases" / item.path).read_bytes() == content
+
+
 def test_hugging_face_metadata_shape(tmp_path):
     class Response:
         def raise_for_status(self): pass
@@ -329,3 +369,103 @@ def test_metadata_only_sqlite_is_not_treated_as_source_text(tmp_path):
 
     with pytest.raises(RuntimeError, match="not installed"):
         corpus.fetch("2024 SCC 1", "cases")
+
+
+def test_runtime_build_refuses_partial_source_snapshot(tmp_path):
+    source = tmp_path / "source" / "cases"
+    source.mkdir(parents=True)
+    first = _parquet(source / "one.parquet", "2024 SCC 1", "One", "one")
+    second = _parquet(source / "two.parquet", "2024 SCC 2", "Two", "two")
+    (source / "manifest.json").write_text(
+        json.dumps({"revision": "rev", "files": [asdict(first), asdict(second)]}),
+        encoding="utf-8",
+    )
+    (source / second.path).unlink()
+    database = tmp_path / "a2aj.sqlite"
+    corpus = LocalA2AJCorpus(tmp_path / "source", runtime_db=database)
+
+    with pytest.raises(RuntimeError, match="snapshot is incomplete"):
+        corpus.build_runtime_database()
+
+    assert not database.exists()
+    assert not database.with_suffix(database.suffix + ".new").exists()
+
+
+def test_cancelled_runtime_build_removes_partial_database(tmp_path):
+    source = tmp_path / "source" / "cases"
+    source.mkdir(parents=True)
+    first = _parquet(source / "one.parquet", "2024 SCC 1", "One", "one")
+    second = _parquet(source / "two.parquet", "2024 SCC 2", "Two", "two")
+    (source / "manifest.json").write_text(
+        json.dumps({"revision": "rev", "files": [asdict(first), asdict(second)]}),
+        encoding="utf-8",
+    )
+    database = tmp_path / "a2aj.sqlite"
+    corpus = LocalA2AJCorpus(tmp_path / "source", runtime_db=database)
+    calls = 0
+
+    def cancel_after_first_source():
+        nonlocal calls
+        calls += 1
+        return calls > 1
+
+    with pytest.raises(InstallCancelled):
+        corpus.build_runtime_database(cancelled=cancel_after_first_source)
+
+    assert not database.exists()
+    assert not database.with_suffix(database.suffix + ".new").exists()
+
+
+def test_packaged_a2aj_lifecycle_fresh_reboot_and_update(tmp_path):
+    """Exercise the three AppData states used by a packaged desktop app."""
+    source = tmp_path / "fixtures"
+    source.mkdir()
+    first = source / "first.parquet"
+    changed = source / "changed.parquet"
+    first_file = _parquet(first, "2024 SCC 1", "First Case", "first text")
+    changed_file = _parquet(changed, "2024 SCC 1", "First Case", "updated text")
+    root = tmp_path / "OpenLegalProducts" / "providers" / "a2aj" / "source"
+    corpus = CopyingCorpus(root, {first_file.sha256: first, changed_file.sha256: changed})
+
+    # Fresh install: no corpus has been downloaded and no runtime exists.
+    assert not root.exists()
+    assert corpus.status("cases").installed is False
+    assert corpus.runtime_ready() is False
+
+    initial = RemoteSnapshot(
+        "cases", "a2aj/test", "rev-1", "2026-01-01", (first_file,)
+    )
+    assert corpus.install_or_update("cases", remote=initial).installed
+    assert corpus.runtime_ready()
+
+    # Reboot: a new process sees the same installed corpus and SQLite runtime.
+    rebooted = CopyingCorpus(
+        root,
+        {first_file.sha256: first, changed_file.sha256: changed},
+    )
+    rebooted.runtime_db = corpus.runtime_db
+    assert rebooted.status("cases").installed is True
+    assert rebooted.runtime_ready() is True
+    assert rebooted.fetch("2024 SCC 1", "cases")["json"]["results"][0][
+        "unofficial_text_en"
+    ] == "first text"
+
+    # Stale update: the new snapshot is detected and atomically replaces the
+    # active source/runtime without leaving a staging or backup directory.
+    updated = RemoteSnapshot(
+        "cases", "a2aj/test", "rev-2", "2026-01-08", (changed_file,)
+    )
+    assert rebooted.status("cases", updated).stale is True
+    rebooted.install_or_update("cases", remote=updated)
+    reopened = CopyingCorpus(
+        root,
+        {first_file.sha256: first, changed_file.sha256: changed},
+    )
+    reopened.runtime_db = corpus.runtime_db
+    assert reopened.status("cases").installed is True
+    assert reopened.runtime_ready() is True
+    assert reopened.fetch("2024 SCC 1", "cases")["json"]["results"][0][
+        "unofficial_text_en"
+    ] == "updated text"
+    assert not list(root.glob(".cases-*.staging"))
+    assert not list(root.glob(".cases-*.backup"))

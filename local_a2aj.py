@@ -517,9 +517,13 @@ class LocalA2AJCorpus:
                 if not relative:
                     continue
                 path = self.root / kind / _safe_relative(relative)
-                if path.is_file():
-                    dataset = PurePosixPath(relative).parts[0]
-                    sources.append((kind, dataset, path))
+                expected_size = int(item.get("size") or 0)
+                if not path.is_file() or path.stat().st_size != expected_size:
+                    raise RuntimeError(
+                        f"Installed A2AJ snapshot is incomplete: {kind}/{relative}"
+                    )
+                dataset = PurePosixPath(relative).parts[0]
+                sources.append((kind, dataset, path))
         if not sources:
             raise RuntimeError("No installed A2AJ source snapshots were found")
 
