@@ -11,15 +11,22 @@ from verifier_core.document_input import ParsedDocument
 fitz = pytest.importorskip("fitz")
 
 
+def _manifest_sha256(path: Path) -> str:
+    # Git may check out tracked text with CRLF on Windows and LF elsewhere.
+    # Hash one canonical representation so the vendored-runtime check is
+    # portable while still detecting content changes.
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def test_vendored_engine_matches_its_release_manifest():
     root = Path(pdf_adapter.__file__).parent / "legalpdf_engine"
     manifest = json.loads((root / "VENDORED.json").read_text(encoding="utf-8"))
 
     for relative, expected in manifest["files"].items():
-        assert hashlib.sha256((root / relative).read_bytes()).hexdigest() == expected
+        assert _manifest_sha256(root / relative) == expected
     for relative, expected in manifest["grammar_tables"].items():
         path = root.parents[1] / "data" / "grammar-tables" / relative
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
+        assert _manifest_sha256(path) == expected
 
 
 def _make_pdf(path: Path) -> None:
