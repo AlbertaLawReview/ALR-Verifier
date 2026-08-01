@@ -7,20 +7,31 @@ articles get linked automatically, including a direct link right to the relevant
 page, paragraph, or section where possible. Using [A2AJ's free API](https://a2aj.ca/data/), quotes get checked against their sources: 
 you can see if the supplied quote matches the source, and whether it's at the pinpoint specified,
 or at a different pinpoint. If it's partially matching, you see what parts of the quote were changed.
-This save enormous time in the law review editing process, and may assist other legal research
+This saves enormous time in the law review editing process, and may assist other legal research
 endeavours as well. An experimental feature allows analysis of PDFs which would, for example,
 allow a lawyer to quickly review the sources in an opposing litigant's brief.
+
+## Quick start for Windows
+
+For non-technical users:
+
+1. Download `ALR-Quote-Verifier-windows-x64.zip` and its matching `.sha256` file from the [latest release](https://github.com/AlbertaLawReview/ALR-Verifier/releases/latest).
+2. Right-click the ZIP file, choose **Extract All**, and open the extracted folder. There is no separate installer.
+3. Double-click **ALR Quote Verifier.exe**.
+4. If Windows shows **Windows protected your PC**, click **More info** and then **Run anyway** only if you downloaded this release from this page and the app name is correct. If Defender reports a virus or other threat, cancel and do not run it.
+5. Use **Add files** to select your Word `.docx` files, choose your settings, and press **Run**. Finished Excel workbooks are written to the `CHECKED_EDITS` folder.
+6. Modes that use AI ask for your OpenAI API key. OpenAI bills that usage under your account. **Free** mode makes no AI calls.
 
 ## Example workbook
 
 ![Generated workbook showing a checked quotation marked Perfect Match](assets/workbook-example.png)
-## Download for Windows
+## Download details
 
 Download the latest ZIP and its SHA-256 checksum from the
 [GitHub releases page](https://github.com/AlbertaLawReview/ALR-Verifier/releases/latest).
 Keep the files together and verify the checksum before running the application.
 
-## Install and run
+## Run from source (technical)
 
 Python 3.11 or newer is recommended. Tk must be available in the Python
 installation.
@@ -31,7 +42,7 @@ installation.
     python gui.py
 
 On macOS or Linux, activate the environment with
-source .venv/bin/activate. Add or drag one or more DOCX files into the window,
+source .venv/bin/activate. Use **Add files** to select one or more DOCX files,
 choose the settings, and press Run. Review workbooks are written to
 CHECKED_EDITS by default.
 
@@ -64,6 +75,14 @@ references that Safe leaves unresolved. Safe is the default.
 These rough estimates use the GPT-5.2 rates and 20-page test document measured
 in July 2026. Actual API cost varies with citation density and model pricing.
 
+## Model choice
+
+AI modes currently use GPT-5.2. We compared it under the production workflow
+with DeepSeek Flash 0731 and GPT-5.6 Luna, Terra, and Sol. GPT-5.2 was the
+best cost-and-accuracy balance: cheaper Luna runs were materially less
+accurate, while Terra and Sol matched or exceeded its accuracy only at a much
+higher price, including their lower-effort tiers.
+
 ## Network access and privacy
 
 Depending on the selected mode and source settings, the application may send
@@ -81,10 +100,9 @@ runtime used for every lookup. The separate **Local only** setting requires
 that complete corpus and prevents verification runs from making network
 requests; journal retrieval and the bundled reference database are already
 local. Installing or updating the corpus is an explicit network operation and
-currently requires about 4.9 GB of storage. Source installations need the
-optional importer first:
-
-    python -m pip install -r requirements-a2aj.txt
+currently requires about 4.9 GB of storage. The corpus feature is included in
+the normal application and source installation; no separate importer setup is
+needed.
 
 ## Windows package
 
@@ -95,32 +113,16 @@ notices, and a SHA-256 checksum. The executable is digitally signed.
 ## Test
 
     python -m pip install -r requirements.txt pytest
-    python tools/sync_legalpdf_engine.py check
     python -X utf8 -m pytest tests -q
 
 CI runs the test suite on Windows, macOS, and Linux with Python 3.11.
 
-### Updating the legal-PDF engine
+### PDF parsing
 
-The repository contains the complete runtime used by ALR Quote Verifier, so a
-normal clone, test run, and build never require another repository or a path on
-the maintainer's computer. To promote a committed engine revision, clone or
-open `universal-legal-pdf-engine` anywhere and run:
-
-    python tools/sync_legalpdf_engine.py sync --engine <engine-checkout>
-    python tools/sync_legalpdf_engine.py check --engine <engine-checkout>
-    python -X utf8 -m pytest tests/test_pdf_adapter.py -q
-
-The sync refuses uncommitted engine changes and records the exact commit and
-SHA-256 of every copied runtime file. For a byte-identical performance change,
-compare a clean baseline ALR worktree with the candidate on representative
-PDFs before committing:
-
-    python tools/compare_legalpdf_vendor.py --baseline <old-alr-worktree> --candidate . --pdf <sample.pdf> --repeat 7 --require-faster
-
-Any stable ALR document-contract difference or non-improving median exits with
-an error. Intentional parsing changes require reviewing the reported contract
-difference and updating the relevant regression fixture explicitly.
+The legal-PDF parser is included directly in this repository as a fixed,
+self-contained snapshot. The application uses that copy directly; normal
+clones, tests, and builds do not require another engine checkout or a sync
+step.
 
 ## Key contributors
 

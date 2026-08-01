@@ -501,7 +501,8 @@ class LocalA2AJCorpus:
             import duckdb
         except ImportError as exc:
             raise RuntimeError(
-                "Installing the A2AJ corpus requires the optional duckdb importer"
+                "The A2AJ corpus feature needs the dependencies in requirements.txt. "
+                "Install them and try again."
             ) from exc
 
         sources: list[tuple[str, str, Path]] = []
