@@ -24,7 +24,7 @@ For non-technical users:
 
 ## Example workbook
 
-![Generated workbook showing a checked quotation marked Perfect Match](assets/workbook-example.png)
+![Generated workbook showing a checked quotation marked Perfect Match](https://raw.githubusercontent.com/AlbertaLawReview/ALR-Verifier/main/assets/workbook-example.png)
 ## Download details
 
 Download the latest ZIP and its SHA-256 checksum from the
