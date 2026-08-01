@@ -8,7 +8,8 @@ page, paragraph, or section where possible. Using [A2AJ's free API](https://a2aj
 you can see if the supplied quote matches the source, and whether it's at the pinpoint specified,
 or at a different pinpoint. If it's partially matching, you see what parts of the quote were changed.
 This save enormous time in the law review editing process, and may assist other legal research
-endeavours as well.
+endeavours as well. An experimental feature allows analysis of PDFs which would, for example,
+allow a lawyer to quickly review the sources in an opposing litigant's brief.
 
 ## Example workbook
 
