@@ -73,11 +73,9 @@ references that Safe leaves unresolved. Safe is the default.
 
 These rough estimates use the GPT-5.2 rates and 20-page test document measured
 in July 2026. Actual API cost varies with citation density and model pricing.
-AI modes currently use GPT-5.2. We compared it under the production workflow
-with DeepSeek Flash 0731 and GPT-5.6 Luna, Terra, and Sol. GPT-5.2 was the
-best cost-and-accuracy balance: cheaper Luna runs were materially less
-accurate, while Terra and Sol matched or exceeded its accuracy only at a much
-higher price, including their lower-effort tiers.
+AI modes currently use GPT-5.2. (We compared it under the production workflow
+with DeepSeek Flash 0731 and GPT-5.6 Luna, Terra, and Sol. GPT-5.2 was by far
+the best balance of cost and accuracy.)
 
 ## Network access and privacy
 
