@@ -1059,7 +1059,12 @@ class BlindFragmentBuildTests(unittest.TestCase):
 
     tearDown = setUp
 
-    def test_a2aj_paragraph_index_uses_consecutive_observed_sequence(self):
+    def test_a2aj_paragraph_index_refuses_a_gapped_sequence(self):
+        """A2AJ renders every glyph, so a hole in the ladder is not a paragraph
+        we should bridge over -- it means the markers are not what they look
+        like. Bridging [2] to [4] to [6] used to advertise a paragraph range
+        the decision never had, and a pinpoint built on it links to the wrong
+        text."""
         text = "\n".join(
             [
                 "2024 SCC 99",
@@ -1072,16 +1077,32 @@ class BlindFragmentBuildTests(unittest.TestCase):
                 "[8] Eighth paragraph contains enough ordinary decision prose to establish substantive structure.",
             ]
         )
+        self.assertEqual(verifier._a2aj_paragraph_index(text), [])
+
+    def test_a2aj_paragraph_index_indexes_a_rooted_sequence(self):
+        text = "\n".join(
+            [
+                "2024 SCC 99",
+                "[1] First paragraph contains enough ordinary decision prose to establish substantive structure.",
+                "[2] Second paragraph contains enough ordinary decision prose to establish substantive structure.",
+                "19. (1) An embedded statutory provision.",
+                "[3] Third paragraph contains the distinctive quotation and enough substantive decision prose.",
+                "[4] Fourth paragraph contains enough ordinary decision prose to establish substantive structure.",
+                "[5] Fifth paragraph contains enough ordinary decision prose to establish substantive structure.",
+                "[6] Sixth paragraph contains enough ordinary decision prose to establish substantive structure.",
+            ]
+        )
         index = verifier._a2aj_paragraph_index(text)
-        self.assertEqual([number for number, *_rest in index], [1, 2, 4, 6, 7, 8])
+        self.assertEqual([number for number, *_rest in index], [1, 2, 3, 4, 5, 6])
+        # The embedded provision stays inside paragraph 2's span, not its own.
         self.assertIn("19. (1)", index[1][3])
         located = verifier._locate_a2aj_paragraph(
             text,
             "distinctive quotation",
             self.FAKE_URL,
         )
-        self.assertEqual(located["label"], "par4")
-        self.assertTrue(located["link"].endswith("#par4"))
+        self.assertEqual(located["label"], "par3")
+        self.assertTrue(located["link"].endswith("#par3"))
 
     def test_a2aj_paragraph_index_rejects_merely_increasing_numbers(self):
         text = "\n".join(f"{number}. Citation or list item" for number in [2, 10, 20, 30, 40, 50])

@@ -51,6 +51,69 @@ def test_linked_note_target_still_resolves():
     assert method == "note_number"
 
 
+def test_numbered_supra_ignores_prose_before_multiword_short_form():
+    registry = [
+        {
+            "verbatim": "Legal Profession Act, RSA 2000, c L-8.",
+            "link": "https://example.test/legal-profession-act#sec49.2",
+            "short_form": "Legal Profession Act",
+            "note": "28",
+        },
+    ]
+    link, method = aqv._resolve_supra_from_registry(
+        "adding s 53(1.1) to the Legal Profession Act, supra note 28.",
+        registry,
+    )
+    assert link == "https://example.test/legal-profession-act#sec49.2"
+    assert method == "note_number_short_form_suffix"
+
+
+def test_numbered_supra_prose_suffix_still_abstains_on_ambiguous_works():
+    registry = [
+        {
+            "verbatim": "Legal Profession Act, RSA 2000, c L-8.",
+            "link": "https://example.test/alberta-lpa",
+            "short_form": "Legal Profession Act",
+            "note": "28",
+        },
+        {
+            "verbatim": "Legal Profession Act, SBC 1998, c 9.",
+            "link": "https://example.test/bc-lpa",
+            "short_form": "Legal Profession Act",
+            "note": "28",
+        },
+    ]
+    link, method = aqv._resolve_supra_from_registry(
+        "adding a provision to the Legal Profession Act, supra note 28.",
+        registry,
+    )
+    assert link == ""
+    assert method == "abstain_ambiguous_note_number_suffix"
+
+
+def test_numbered_supra_prose_suffix_does_not_borrow_for_unlinked_target():
+    registry = [
+        {
+            "verbatim": "Legal Profession Act, RSA 2000, c L-8.",
+            "link": "",
+            "short_form": "Legal Profession Act",
+            "note": "28",
+        },
+        {
+            "verbatim": "Legal Profession Act, SBC 1998, c 9.",
+            "link": "https://example.test/bc-lpa",
+            "short_form": "Legal Profession Act",
+            "note": "11",
+        },
+    ]
+    link, method = aqv._resolve_supra_from_registry(
+        "adding a provision to the Legal Profession Act, supra note 28.",
+        registry,
+    )
+    assert link == ""
+    assert method == "abstain_unlinked_target"
+
+
 def test_drifted_note_number_still_recovers_through_pools():
     registry = [
         {

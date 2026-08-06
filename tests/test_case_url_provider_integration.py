@@ -575,7 +575,25 @@ def test_alternate_pinpoint_fragment_disambiguates_from_registered_full_text():
     # sentence and a quoted secondary source); the registered A2AJ full text
     # supplies the context that makes the par9 copy uniquely addressable.
     url = "https://www.canlii.org/en/ca/scc/doc/2020/2020scc32/2020scc32.html#par9"
+    # Registered text is the whole decision, so the ladder starts at [1]. The
+    # paragraph index declines a spine that is not rooted at 1, on the grounds
+    # that a decision beginning at [7] means the opening was lost rather than
+    # that the author started counting there - so an excerpt here would prove
+    # nothing about the production path, which is always fed full text.
     document_text = (
+        "[1] This appeal comes to the Court from the judgment below, and the "
+        "facts are set out in the reasons of the courts beneath us.\n"
+        "[2] The appellant applied for relief under the provision, and the "
+        "chambers judge dismissed that application with brief reasons.\n"
+        "[3] The Court of Appeal allowed the appeal, substituting its own "
+        "reading of the provision for the one the chambers judge adopted.\n"
+        "[4] Leave to appeal to this Court was granted, and the intervenors "
+        "filed submissions addressing the interpretive question directly.\n"
+        "[5] The standard of review is not in dispute between the parties, "
+        "and the question before the Court is one of law reviewed for "
+        "correctness.\n"
+        "[6] It is convenient to set out the statutory scheme before turning "
+        "to the competing interpretations the parties press upon us.\n"
         "[7] The appeal raises a question about the proper approach to "
         "interpreting the constitutional provision at issue in this case.\n"
         "[8] Both parties accept that the analysis must begin from the "

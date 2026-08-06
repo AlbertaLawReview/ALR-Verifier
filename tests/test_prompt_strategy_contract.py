@@ -7,6 +7,25 @@ import alr_quote_verifier as verifier
 
 
 class PromptStrategyContractTests(unittest.TestCase):
+    def test_gpt56_caches_only_the_stable_prompt_prefix(self):
+        with mock.patch.object(verifier, "LLM_MODEL", "gpt-5.6-terra"):
+            prompt, options = verifier._footnote_prompt_input(
+                "stable instructions", "changing history", "current footnote"
+            )
+
+        self.assertEqual(options, {
+            "extra_body": {"prompt_cache_options": {"mode": "explicit"}},
+        })
+        self.assertEqual(prompt[0]["content"], [
+            {
+                "type": "input_text",
+                "text": "stable instructions",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+            {"type": "input_text", "text": "changing history"},
+        ])
+        self.assertEqual(prompt[1], {"role": "user", "content": "current footnote"})
+
     def test_splitter_uses_the_production_prompt_with_accumulated_history(self):
         response = SimpleNamespace(output_text=json.dumps({
             "parts": [{

@@ -8,6 +8,29 @@ import alr_quote_verifier as verifier
 
 
 class LLMCachePathTests(unittest.TestCase):
+    def test_fast_service_tier_has_a_distinct_cache_fingerprint(self):
+        original = verifier.LLM_SERVICE_TIER
+        try:
+            verifier.LLM_SERVICE_TIER = "default"
+            standard = verifier._footnote_request_config(
+                system_prompt="prompt", prompt_fingerprint="prompt:test",
+                text="R v Example, 2024 SCC 1.", previous_citations="",
+            )
+            verifier.LLM_SERVICE_TIER = "fast"
+            fast = verifier._footnote_request_config(
+                system_prompt="prompt", prompt_fingerprint="prompt:test",
+                text="R v Example, 2024 SCC 1.", previous_citations="",
+            )
+        finally:
+            verifier.LLM_SERVICE_TIER = original
+
+        self.assertNotIn("service_tier", standard)
+        self.assertEqual(fast["service_tier"], "fast")
+        self.assertNotEqual(
+            verifier._footnote_request_fingerprint(standard),
+            verifier._footnote_request_fingerprint(fast),
+        )
+
     def test_source_run_cache_uses_repo_module_dir(self):
         # From source the LLM cache lives under the shared cache/ folder.
         expected = os.path.join(
@@ -87,11 +110,14 @@ class LLMCachePathTests(unittest.TestCase):
                     f,
                 )
 
-            loaded = verifier._load_footnote_cache_entry(
-                cache_path,
-                request_fingerprint=verifier._footnote_request_fingerprint(new_config),
-                lookup_fingerprint=lookup_fingerprint,
-            )
+            resolver = mock.Mock()
+            resolver.resolve_url.return_value = ""
+            with mock.patch.object(verifier, "LINK_RESOLVER", resolver):
+                loaded = verifier._load_footnote_cache_entry(
+                    cache_path,
+                    request_fingerprint=verifier._footnote_request_fingerprint(new_config),
+                    lookup_fingerprint=lookup_fingerprint,
+                )
 
         self.assertIsNotNone(loaded)
         parts, _history, hit_kind = loaded

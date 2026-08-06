@@ -2674,6 +2674,37 @@ LLM_API_KEY: str = ""  # overrides everything when set
 # the environment so callers can point elsewhere
 # without code changes.
 LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "")
+# Benchmark/API transport choice. Production remains standard unless a caller
+# explicitly opts into OpenAI Fast mode.
+LLM_SERVICE_TIER: str = "default"
+
+# Selected inference provider. "openai" is the production path and uses the
+# globals above. MUSE_PROVIDER routes the same OpenAI-compatible client at
+# Meta's Model API with its own credential (META_API_KEY). Env override so a
+# CLI or bench run can switch without code changes.
+#
+# CONFIDENTIALITY WARNING: the "-contributor" suffix is not a model variant,
+# it is Meta's data-sharing price tier — the discount is granted in exchange
+# for permission to train future Meta models on submitted prompts and
+# completions. Every footnote and quoted source passage this app sends is
+# unpublished manuscript text, so this provider must stay opt-in and must
+# never become the default. Use plain "muse-spark-1.2" (via MUSE_MODEL) for
+# any run touching real author material.
+MUSE_PROVIDER: str = "muse-spark-1.2-contributor"
+LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "openai")
+# Endpoint for MUSE_PROVIDER. Left unset on purpose so nothing is routed off
+# api.openai.com by accident: selecting the provider without configuring this
+# raises. Meta's published base URL for the Model API is
+# https://api.meta.ai/v1 (its Responses API is drop-in compatible with the
+# openai SDK surface used below), but pointing at it is a deliberate act.
+MUSE_BASE_URL: str = os.environ.get("MUSE_BASE_URL", "")
+# Model id the endpoint expects. Meta's own docs list "muse-spark-1.2" and
+# "muse-spark-1.1"; how the contributor tier is selected (model id suffix vs
+# account setting) is not documented, so this stays overridable.
+MUSE_MODEL: str = os.environ.get("MUSE_MODEL", MUSE_PROVIDER)
+# Captured before any provider switch so deselecting muse restores production.
+_DEFAULT_LLM_MODEL: str = LLM_MODEL
+
 
 def _get_key(env_var: str) -> str:
     key = os.environ.get(env_var, "")
@@ -2701,6 +2732,63 @@ def _resolve_api_key() -> str:
         return ""
 
 
+def _resolve_muse_api_key() -> str:
+    """Credential for MUSE_PROVIDER: an explicit LLM_API_KEY override first,
+    then META_API_KEY from the environment or the dev keys.py module.
+    MODEL_API_KEY is accepted as a second name because that is what Meta's own
+    quickstart exports. Never falls back to an OpenAI credential."""
+    return LLM_API_KEY or _get_key("META_API_KEY") or _get_key("MODEL_API_KEY")
+
+
+def _missing_muse_base_url_error() -> RuntimeError:
+    return RuntimeError(
+        f"Inference provider {MUSE_PROVIDER!r} is selected but no endpoint is "
+        "configured. Set the MUSE_BASE_URL environment variable (or assign "
+        "alr_quote_verifier.MUSE_BASE_URL) to the provider's OpenAI-compatible "
+        "base URL before running. There is no default: the endpoint is not "
+        "published in this repo."
+    )
+
+
+def _resolve_llm_endpoint() -> tuple[str, str]:
+    """(api_key, base_url) for the active provider.
+
+    Any provider other than MUSE_PROVIDER keeps the existing behaviour. Muse
+    needs an explicitly configured endpoint (no default to guess), and a
+    missing META_API_KEY degrades to the default provider rather than
+    presenting an OpenAI credential to a third-party endpoint."""
+    if LLM_PROVIDER != MUSE_PROVIDER:
+        return _resolve_api_key(), LLM_BASE_URL
+    if not MUSE_BASE_URL:
+        raise _missing_muse_base_url_error()
+    key = _resolve_muse_api_key()
+    if not key:
+        return _resolve_api_key(), LLM_BASE_URL
+    return key, MUSE_BASE_URL
+
+
+def _select_llm_provider(name: str) -> str:
+    """Switch the shared client to an inference provider and return the one
+    actually in force. Selecting MUSE_PROVIDER without META_API_KEY falls back
+    to the default provider; selecting it without MUSE_BASE_URL raises."""
+    global LLM_PROVIDER, LLM_MODEL, client
+    requested = (name or "openai").strip() or "openai"
+    if requested not in ("openai", MUSE_PROVIDER):
+        raise RuntimeError(
+            f"Unknown inference provider {requested!r}; expected 'openai' or "
+            f"{MUSE_PROVIDER!r}."
+        )
+    if requested == MUSE_PROVIDER:
+        if not MUSE_BASE_URL:
+            raise _missing_muse_base_url_error()
+        if not _resolve_muse_api_key():
+            requested = "openai"
+    LLM_PROVIDER = requested
+    LLM_MODEL = MUSE_MODEL if requested == MUSE_PROVIDER else _DEFAULT_LLM_MODEL
+    client = None
+    return requested
+
+
 _LLM_CLIENT_LOCK = threading.Lock()
 
 
@@ -2711,7 +2799,8 @@ def _ensure_llm_client() -> OpenAI:
     from openai import OpenAI
     with _LLM_CLIENT_LOCK:
         if client is None:
-            client = OpenAI(api_key=_resolve_api_key(), base_url=(LLM_BASE_URL or None))
+            api_key, base_url = _resolve_llm_endpoint()
+            client = OpenAI(api_key=api_key, base_url=(base_url or None))
     return client
 
 
@@ -2727,6 +2816,8 @@ def _llm_call(**kwargs):
     """Every model call funnels through here. The request payload is built
     by the caller and passed through untouched (cache fingerprints depend
     on it); only the transport differs when a governor is installed."""
+    if LLM_SERVICE_TIER != "default" and "service_tier" not in kwargs:
+        kwargs = dict(kwargs, service_tier=LLM_SERVICE_TIER)
     llm = _ensure_llm_client()
     gov = _LLM_GOVERNOR
     raw_capable = getattr(getattr(llm, "responses", None), "with_raw_response", None)
@@ -2739,6 +2830,27 @@ def _llm_call(**kwargs):
     except Exception:
         pass
     return raw.parse()
+
+
+def _footnote_prompt_input(system_prompt: str, previous_citations: str, text: str):
+    """Keep GPT-5.6's stable instructions cacheable as history grows."""
+    if not LLM_MODEL.startswith("gpt-5.6"):
+        return [
+            {"role": "system", "content": system_prompt + previous_citations},
+            {"role": "user", "content": text},
+        ], {}
+    system_content = [{
+        "type": "input_text",
+        "text": system_prompt,
+        "prompt_cache_breakpoint": {"mode": "explicit"},
+    }]
+    if previous_citations:
+        system_content.append({"type": "input_text", "text": previous_citations})
+    # Keep compatibility with SDK releases that predate this API field.
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": text},
+    ], {"extra_body": {"prompt_cache_options": {"mode": "explicit"}}}
 
 @dataclass(frozen=True)
 class FootnotePart:
@@ -2754,10 +2866,6 @@ class FootnotePart:
     author_provided_link: str = ""
     author_provided_links: List[str] = field(default_factory=list)
     pre_provider_link: Optional[str] = None
-    # Deterministic source identity for later history/reference resolution.
-    # Neither this nor the coarse witness bit gives the model a pinpoint.
-    authority_id: str = ""
-    source_evidence_found: bool = False
 
 
 _SCR_REPORTED_CITATION_RE = re.compile(
@@ -2815,76 +2923,8 @@ def _build_footnote_history_entries(parts: List["FootnotePart"]) -> str:
             "- Citation: " + (part.verbatim or "")
             + " --> Link: " + link_base
             + " --> short_form: " + ((part.short_form or "").strip() or "N/A") + "\n"
-            + (
-                "  --> source_evidence_found: true\n"
-                if part.source_evidence_found else ""
-            )
         )
     return "".join(entries)
-
-
-def _interleave_a2aj_evidence(
-    parts: List["FootnotePart"], proposition_text: str,
-) -> List["FootnotePart"]:
-    """Attach only positive, pinpoint-free A2AJ evidence for later history.
-
-    The full verifier still owns quote status and locator recovery.  This
-    narrow pass exists so later sequential footnotes can benefit from an
-    already-proven source association without learning whether the quote was
-    found at the cited paragraph, another paragraph, or only as an accepted
-    partial overlap.  Misses are represented by no field at all.
-    """
-    if not USE_A2AJ:
-        return parts
-
-    quotes = [
-        (quote.get("inner") or quote.get("raw") or "").strip()
-        for quote in find_inline_quotes(proposition_text or "")
-        if (quote.get("inner") or quote.get("raw") or "").strip()
-    ]
-    enriched: List[FootnotePart] = []
-    for part in parts:
-        if (part.kind or "").strip().lower() not in {
-            "case", "unreported", "statute", "gazette",
-        }:
-            enriched.append(part)
-            continue
-        query = _a2aj_query_citation(
-            part.bare_citation or part.citation_with_style or part.verbatim
-        )
-        if not query:
-            enriched.append(part)
-            continue
-        try:
-            lookup = a2aj_client.lookup_document(query, part.kind)
-        except Exception:
-            enriched.append(part)
-            continue
-        document = lookup.document if lookup.status == "found" else None
-        if not document:
-            enriched.append(part)
-            continue
-        identity = "\0".join(
-            (document.dataset, document.citation, document.alternate_citation)
-        )
-        authority_id = "a2aj:" + hashlib.sha256(
-            identity.encode("utf-8")
-        ).hexdigest()[:20]
-        source_text = _normalized_a2aj_document_text(
-            document,
-            "law" if part.kind in {"statute", "gazette"} else "case",
-        )
-        witnessed = bool(
-            quotes
-            and source_text
-            and any(_quote_match_score(quote, source_text) >= 0.6 for quote in quotes)
-        )
-        enriched.append(replace(
-            part,
-            authority_id=authority_id,
-            source_evidence_found=witnessed,
-        ))
-    return enriched
 
 
 # Serializes HTML/URL resolution when footnotes are split in parallel: a
@@ -4021,7 +4061,7 @@ def _footnote_request_config(
 ) -> Dict[str, Any]:
     schema = schema or FOOTNOTE_SPLIT_SCHEMA
     schema_fingerprint = hashlib.sha256(_stable_json(schema).encode("utf-8")).hexdigest()
-    return {
+    config = {
         "cache_version": FOOTNOTE_SPLIT_CACHE_VERSION,
         "api": "responses.create",
         "model": LLM_MODEL,
@@ -4041,6 +4081,9 @@ def _footnote_request_config(
         "required_part_fields": list(schema["properties"]["parts"]["items"]["required"]),
         "required_top_level_fields": list(schema["required"]),
     }
+    if LLM_SERVICE_TIER != "default":
+        config["service_tier"] = LLM_SERVICE_TIER
+    return config
 
 
 def _footnote_request_fingerprint(config: Dict[str, Any]) -> str:
@@ -4318,7 +4361,6 @@ def split_footnote_parts(
     system_prompt = SYSTEM_INSTRUCTIONS
     response_schema = FOOTNOTE_SPLIT_SCHEMA
     prompt_fingerprint = _prompt_cache_fingerprint(system_prompt)
-    current_system_prompt = system_prompt + previous_citations
     request_config = _footnote_request_config(
         system_prompt=system_prompt,
         prompt_fingerprint=prompt_fingerprint,
@@ -4369,12 +4411,12 @@ def split_footnote_parts(
 
     _pause_gate()
 
+    prompt_input, cache_options = _footnote_prompt_input(
+        system_prompt, previous_citations, text
+    )
     response = _llm_call(
         model=LLM_MODEL,
-        input=[
-            {"role": "system", "content": current_system_prompt},
-            {"role": "user", "content": text},
-        ],
+        input=prompt_input,
         reasoning=FOOTNOTE_RESPONSE_REASONING,
         max_output_tokens=FOOTNOTE_RESPONSE_MAX_OUTPUT_TOKENS,
         text={
@@ -4385,6 +4427,7 @@ def split_footnote_parts(
                 "schema": response_schema,
             }
         },
+        **cache_options,
     )
     raw = response.output_text
 
@@ -5246,6 +5289,40 @@ def _resolve_supra_from_registry(
                 blob = _norm_ref_text(_ref_registry_match_text(e))
                 if all(t in blob for t in tokens):
                     return e.get("link", ""), "note_number"
+            # A citation may introduce the named supra with ordinary prose:
+            # "adding s 53 ... to the Legal Profession Act, supra note 28".
+            # The numbered note supplies the hard scope, so accept a final
+            # multiword short-form match only when every linked match points
+            # at the same work. One-word names keep the stricter path above.
+            suffix_matches: List[Dict[str, str]] = []
+            for e in registry:
+                if e.get("note") != str(note_n):
+                    continue
+                short_tokens = _ref_hint_tokens(e.get("short_form", ""))
+                if (
+                    len(short_tokens) >= 2
+                    and len(tokens) >= len(short_tokens)
+                    and tokens[-len(short_tokens):] == short_tokens
+                ):
+                    suffix_matches.append(e)
+            linked_suffix_matches = [
+                e for e in suffix_matches
+                if str(e.get("link") or "").strip()
+                and str(e.get("link") or "").strip().lower() != "other"
+            ]
+            suffix_bases = {
+                _ref_base_url(str(e.get("link") or "")).lower()
+                for e in linked_suffix_matches
+            }
+            if len(suffix_bases) == 1:
+                return (
+                    linked_suffix_matches[0].get("link", ""),
+                    "note_number_short_form_suffix",
+                )
+            if linked_suffix_matches:
+                return "", "abstain_ambiguous_note_number_suffix"
+            if suffix_matches:
+                return "", "abstain_unlinked_target"
             # When an UNLINKED entry from footnote N matches every hint
             # token, the note number is verifiably correct and the cited
             # work is known — it just has no link. Borrowing a link from a
@@ -5451,8 +5528,9 @@ def _ref_disambig_choose(
     choice: Optional[int] = None
     cache_path = ""
     if LLM_CACHE_ENABLED:
+        tier_marker = "" if LLM_SERVICE_TIER == "default" else f"{LLM_SERVICE_TIER}|"
         key = hashlib.sha256(
-            f"{LLM_MODEL}|none|{REF_DISAMBIG_SYSTEM}|{user}".encode("utf-8")
+            f"{LLM_MODEL}|{tier_marker}none|{REF_DISAMBIG_SYSTEM}|{user}".encode("utf-8")
         ).hexdigest()
         cache_path = os.path.join(_llm_cache_dir(), f"refdisambig_{key}.json")
         if os.path.exists(cache_path):
@@ -5664,7 +5742,6 @@ def build_footnote_parts(
                 "link": part.link,
                 "short_form": part.short_form,
                 "note": note,
-                "authority_id": part.authority_id,
             })
             if (
                 SUPRA_LINKING_AGGRESSIVENESS == "aggressive"
@@ -5702,9 +5779,6 @@ def build_footnote_parts(
                     allow_fallback=False,
                     inferred_short_forms=history_inferred_short_forms,
                 )
-            pre_parts = _interleave_a2aj_evidence(
-                pre_parts, (prop_texts or {}).get(fid, "")
-            )
             doc_history += _build_footnote_history_entries(pre_parts)
             split_by_fid[fid] = pre_parts
             prev_split = pre_parts
@@ -5736,9 +5810,6 @@ def build_footnote_parts(
                     allow_fallback=False,
                     inferred_short_forms=history_inferred_short_forms,
                 )
-            split = _interleave_a2aj_evidence(
-                split, (prop_texts or {}).get(fid, "")
-            )
             doc_history += _build_footnote_history_entries(split)
             split_by_fid[fid] = split
             prev_split = split
@@ -5763,9 +5834,6 @@ def build_footnote_parts(
             split = _snap_verbatim_parts(full, split)
             split = _apply_author_provided_links(
                 full, split, (author_links_by_fid or {}).get(fid)
-            )
-            split = _interleave_a2aj_evidence(
-                split, (prop_texts or {}).get(fid, "")
             )
             new_entries = _build_footnote_history_entries(split)
             _timing_event(
@@ -5813,7 +5881,6 @@ def build_footnote_parts(
                     "link": part.link,
                     "short_form": part.short_form,
                     "note": note,
-                    "authority_id": part.authority_id,
                 })
                 if (
                     SUPRA_LINKING_AGGRESSIVENESS == "aggressive"
@@ -5935,8 +6002,6 @@ def build_footnote_parts(
                 "pinpoint_fragments": list(effective_pinpoint_fragments),
                 "page_pinpoints": list(effective_page_pinpoints),
                 "_ref_link_resolution": ref_link_methods.get((fid, idx), ""),
-                "_authority_id": part.authority_id,
-                "_source_evidence_found": part.source_evidence_found,
             }
             row.update({
                 key: value for key, value in a2aj_probe.items()
@@ -10807,6 +10872,13 @@ def _configure_from_args(args: argparse.Namespace) -> None:
     global RUN_MODE, PURE_REF_PREFILTER, DETERMINISTIC_SOURCE_SPLITTER, FREE_NO_LLM, LOCAL_ONLY
     global REF_DISAMBIG_FALLBACK, SUPRA_LINKING_AGGRESSIVENESS
     global LLM_MODEL, LLM_API_KEY, client
+    previous_resolver = LINK_RESOLVER
+    close_previous = getattr(previous_resolver, "close", None)
+    if callable(close_previous):
+        try:
+            close_previous()
+        except Exception:
+            pass
     SUPRA_MODE = getattr(args, "supra_mode", "aggressive") or "aggressive"
     SUPRA_LINKING_AGGRESSIVENESS = (
         getattr(args, "supra_linking", "safe") or "safe"
@@ -10840,11 +10912,13 @@ def _configure_from_args(args: argparse.Namespace) -> None:
         if callable(setter):
             setter(False)
 
-    LLM_MODEL = "gpt-5.2"
-    # Leave LLM_API_KEY as an explicit override only; _ensure_llm_client
-    # resolves the effective key (env/keys.py, then the per-user encrypted
-    # store). Reset the client so it re-creates with new config.
-    client = None
+    # Pin the model to the selected provider's default (production gpt-5.2
+    # unless LLM_PROVIDER names the muse endpoint). Leave LLM_API_KEY as an
+    # explicit override only; _ensure_llm_client resolves the effective key
+    # (env/keys.py, then the per-user encrypted store) and endpoint.
+    # _select_llm_provider also resets the client so it re-creates with new
+    # config.
+    _select_llm_provider(LLM_PROVIDER)
     if not FREE_NO_LLM:
         _ensure_llm_client()
 

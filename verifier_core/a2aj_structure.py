@@ -92,10 +92,6 @@ CHILD_MARK_RE = re.compile(
     re.MULTILINE,
 )
 WORD_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
-HEADING_CONNECTORS = {
-    "a", "an", "and", "as", "at", "by", "for", "from", "in", "of",
-    "on", "or", "the", "to", "v.",
-}
 
 
 def _word_count(text: str) -> int:
@@ -137,78 +133,288 @@ def _numbered_index(
     ]
 
 
-def _looks_like_joined_heading(value: str) -> bool:
-    heading = re.sub(r"^\([\w]+\)\s+", "", value.strip())
-    if not heading or len(heading) > 120 or re.search(r"[\[\];!?]", heading):
-        return False
-    words = heading.split()
-    return (
-        len(words) <= 12
-        and any(word[:1].isupper() for word in words)
-        and all(
-            word.casefold() in HEADING_CONNECTORS
-            or re.fullmatch(r"[A-Z][^\W\d_][\w’'\-]*:?", word, re.UNICODE)
-            or re.fullmatch(r"[A-Z]\.", word)
-            or re.fullmatch(r"\d+(?:\.\d+)*[.):]?", word)
-            for word in words
-        )
+HEADING_MAX_LENGTH = 120
+HEADING_LEVEL_WORD_CAP = 12
+# How long a level may run when nothing but its brevity says it is a heading.
+# Courts write sentence-case headings in two to four words -- "Standard of
+# review", "Decision under review", "Factual background" -- while prose that
+# happens to reach a paragraph number mid-line runs longer: "The court relied
+# on its earlier decision [3]".  Six words is where the two populations
+# separate.
+SENTENCE_LEVEL_WORD_CAP = 6
+
+# A heading level opens with an enumerator: ``II.``, ``B.``, ``3.``, ``(2)``,
+# ``(iv)``.  Courts number the lower levels in lower case and close them with a
+# bracket as readily as with a stop -- ``a) Standard of Review``, ``ii.
+# Discussion`` -- so a single letter or a roman numeral of either case, and
+# either terminator, all count.
+_HEADING_ENUMERATOR_RE = re.compile(
+    r"\([^\W_]{1,5}\)|[^\W\d_][.)]|[IVXLCDM]{1,4}[.)]|[ivxlcdm]{1,4}[.)]"
+    r"|\d{1,3}(?:\.\d{1,3})*[.)]"
+)
+# Marks a heading does not carry.  A semicolon or an exclamation joins or
+# exclaims a clause, and square braces are the corpus's own reporter and
+# editorial marks -- "[Emphasis added.]", or the paragraph numbers themselves,
+# which is what keeps a prose line that already opens with "[8]" from being
+# read as a heading for the "[12]" it cites later on.
+_NOT_IN_HEADING_RE = re.compile(r"[;!\[\]{}]")
+
+
+def _opens_like_heading(text: str) -> bool:
+    """A heading level opens on a capital letter, or on a digit.
+
+    ``isnumeric`` rather than ``isdigit`` so this stays the exact counterpart of
+    the TypeScript ``\\p{N}``, which also covers fractions and roman numerals.
+    """
+    return bool(text) and (text[0].isupper() or text[0].isnumeric())
+
+
+def _title_word(word: str) -> bool:
+    """Whether the first letter in ``word`` is a capital."""
+    for char in word:
+        if char.isalpha():
+            return char.isupper()
+    return False
+
+
+def _heading_level_opener(word: str) -> bool:
+    """The word that must follow an enumerator for it to have opened a level."""
+    return bool(
+        word
+        and not _HEADING_ENUMERATOR_RE.fullmatch(word)
+        and _opens_like_heading(word)
     )
 
 
-def _recover_heading_joined_paragraphs(
-    text: str, spine: list[tuple[int, int]]
-) -> list[tuple[int, int]]:
-    known_offsets = {offset for offset, _number in spine}
-    candidates: dict[int, list[tuple[int, int]]] = {}
-    for match in re.finditer(r"\[(\d{1,4})\]", text):
+def _heading_level(level: list[str], enumerated: bool = False) -> bool:
+    """One level of a heading path, once its enumerator has been taken off.
+
+    A level is judged by its shape, not by the case of every word in it.
+    Judging it word by word was this grammar's largest defect: it required
+    Title Case throughout, and courts do not write headings that way.  Measured
+    over the whole A2AJ corpus, that rule rejected ``Standard of review``,
+    ``The law``, ``On appeal``, ``A. Basis of the claim`` and every French
+    heading -- roughly a quarter of a million real headings -- because each
+    carries a lowercase word after the first.
+
+    What a heading does hold to is shape: it is short, it opens on a capital or
+    a digit, and it does not close the way a sentence closes.  How short it may
+    be depends on how much else about it announces a heading.
+    """
+    if not level or len(level) > HEADING_LEVEL_WORD_CAP:
+        return False
+    # A level that is nothing but its own enumerator is still a level: courts
+    # set ``II.`` on a line of its own above the title it numbers.  The same
+    # rule is what lets a case-name heading parse, ``R. v. Smith`` splitting
+    # into ``R.`` and ``Smith`` around the ``v.``
+    if len(level) == 1 and _HEADING_ENUMERATOR_RE.fullmatch(level[0]):
+        return True
+    text = " ".join(level)
+    if not _opens_like_heading(text) or text[-1] in ".,;":
+        return False
+    # A question announces itself, and courts pose long ones -- "Did the
+    # institution reasonably exercise its discretion?".  So does a colon,
+    # though that also admits judicial attributions ("GILLESE J.A.:", "BY THE
+    # COURT:"), which are not headings at all; they are left in for now because
+    # recovering the paragraph they precede is right, but whether they should
+    # be reaching this grammar rather than a rule of their own is an open
+    # question.
+    if text[-1] in "?:":
+        return True
+    # Title case says heading on its own and may run long.  Only words of four
+    # letters or more count towards it: a heading leaves "of", "the", "and" and
+    # "for" in lower case, so testing those would make every real title fail.
+    #
+    # So does an enumerator the author put there.  "A. Allegation that clause 1
+    # of the agreement was not complied with" is a heading in sentence case
+    # running ten words, and prose does not open on "A." or "I.".  The short cap
+    # is for a level with nothing but its brevity to recommend it, so a level
+    # that was numbered has already stopped being that case and keeps the long
+    # cap instead.
+    title_cased = all(
+        len([char for char in word if char.isalpha()]) < 4 or _title_word(word)
+        for word in level
+    )
+    return title_cased or enumerated or len(level) <= SENTENCE_LEVEL_WORD_CAP
+
+
+def _looks_like_joined_heading(value: str) -> bool:
+    """A2AJ renders a decision's heading path inline, so a joined heading is
+    not one title but a stack of them: ``II. Judicial History A. Judgments on
+    the Application``.  Reading it as a single title is what the twelve-word
+    cap was measuring, and it is why real headings were rejected.  Parse the
+    levels instead: split at enumerators and require every level to be
+    heading-shaped.  An unenumerated prefix is exactly one level, so
+    single-title headings decide exactly as they always have."""
+    heading = re.sub(r"^\([\w]+\)\s+", "", value.strip())
+    if (
+        not heading
+        or len(heading) > HEADING_MAX_LENGTH
+        or _NOT_IN_HEADING_RE.search(heading)
+    ):
+        return False
+    words = heading.split()
+    # Each level carries whether the author numbered it, which is evidence about
+    # the level that its own words no longer hold once the enumerator has been
+    # split off.
+    levels: list[list[str]] = [[]]
+    enumerated: list[bool] = [False]
+    for index, word in enumerate(words):
+        following = words[index + 1] if index + 1 < len(words) else ""
+        if _HEADING_ENUMERATOR_RE.fullmatch(word) and _heading_level_opener(following):
+            if levels[-1]:
+                levels.append([])
+                enumerated.append(True)
+            else:
+                enumerated[-1] = True
+            continue
+        levels[-1].append(word)
+    return all(
+        _heading_level(level, mark) for level, mark in zip(levels, enumerated)
+    )
+
+
+# Weights for the paragraph-label chain, mirroring the universal legal PDF
+# engine's footnote backbone (legalpdf_engine.footnote_pairing).  Evidence is
+# priced rather than gated, so the spine is whichever ladder the document
+# argues for most strongly instead of whichever one a threshold admits.
+_SCORE_LINE_START = 1.0
+_SCORE_HEADING_JOINED = 0.6
+_SCORE_ADJACENT_LINK = 0.3
+
+# The engine's endnote test (detect_endnote_mode), with character offset
+# standing in for page number: a ladder living entirely in the document's tail
+# is a note block, not the paragraph spine.
+ENDNOTE_TAIL_FRACTION = 0.75
+ENDNOTE_MIN_LABELS = 8
+ENDNOTE_TAIL_SHARE = 0.7
+
+Candidate = Tuple[int, int, float]  # offset, number, score
+
+
+def _heading_joined_candidates(
+    text: str, known_offsets: set[int], style: str
+) -> list[Candidate]:
+    pattern = r"\[(\d{1,4})\]" if style == "bracket" else r"(\d{1,4})\.(?=\s)"
+    found: list[Candidate] = []
+    for match in re.finditer(pattern, text):
         if match.start() in known_offsets:
             continue
-        number = int(match.group(1))
-        before = next(
-            (marker for marker in reversed(spine) if marker[0] < match.start()),
-            None,
-        )
-        after = next(
-            (marker for marker in spine if marker[0] > match.start()),
-            None,
-        )
-        between = bool(before and after and before[1] < number < after[1])
-        leading = bool(
-            before is None
-            and after
-            and 0 < number < after[1]
-            and after[1] - number <= 2
-            and after[0] - match.start() <= 2_000
-        )
-        if not between and not leading:
-            continue
         line_start = text.rfind("\n", 0, match.start()) + 1
-        if not _looks_like_joined_heading(text[line_start:match.start()]):
+        heading = text[line_start:match.start()]
+        if not _looks_like_joined_heading(heading):
             continue
-        candidates.setdefault(number, []).append((match.start(), number))
-    recovered = [
-        matches[0] for matches in candidates.values() if len(matches) == 1
+        if style == "dot" and "." in heading:
+            continue
+        found.append((match.start(), int(match.group(1)), _SCORE_HEADING_JOINED))
+    return found
+
+
+def _spine_candidates(
+    text: str, markers: list[tuple[int, int, str]], style: str
+) -> list[Candidate]:
+    """Every marker the document offers for one style, priced by how it
+    presents itself.  Heading-joined labels enter as ordinary weaker
+    candidates rather than through a separate recovery pass."""
+    line = [
+        (offset, number, _SCORE_LINE_START)
+        for offset, number, marker_style in markers
+        if marker_style == style
     ]
-    return sorted([*spine, *recovered])
+    if style == "bare":
+        return line
+    known = {offset for offset, _number, _score in line}
+    return sorted(line + _heading_joined_candidates(text, known, style))
+
+
+def _select_spine_chain(candidates: list[Candidate]) -> tuple[list[Candidate], float]:
+    """The best-scoring chain of consecutive paragraph numbers rooted at 1.
+
+    Neither end is negotiable.  A chain may only open on paragraph 1, and a
+    hole ends it rather than being bridged -- on a source that renders every
+    glyph, both a missing 1 and a missing middle mean the evidence is not what
+    it appears to be.  The score decides only which of the competing ladders
+    rooted at 1 the document actually argues for, so a quoted ladder or a
+    table of paragraph cross-references loses on weight with no bespoke gate.
+    """
+    ordered = sorted(candidates)
+    if not ordered:
+        return [], 0.0
+    neg = float("-inf")
+    best = [neg] * len(ordered)
+    parent = [-1] * len(ordered)
+    best_by_value: dict[int, int] = {}
+    group = 0
+    while group < len(ordered):
+        end = group + 1
+        while end < len(ordered) and ordered[end][0] == ordered[group][0]:
+            end += 1
+        for index in range(group, end):
+            _offset, number, score = ordered[index]
+            best[index] = score if number == 1 else neg
+            parent[index] = -1
+            previous = best_by_value.get(number - 1)
+            if previous is not None and best[previous] > neg:
+                linked = best[previous] + score + _SCORE_ADJACENT_LINK
+                if linked > best[index]:
+                    best[index] = linked
+                    parent[index] = previous
+        # Deferred so two candidates sharing an offset cannot chain together.
+        for index in range(group, end):
+            prior = best_by_value.get(ordered[index][1])
+            if prior is None or best[index] > best[prior]:
+                best_by_value[ordered[index][1]] = index
+        group = end
+    tail = -1
+    for index, value in enumerate(best):
+        if value == neg:
+            continue
+        if tail == -1 or value > best[tail]:
+            tail = index
+    if tail == -1:
+        return [], 0.0
+    chain: list[Candidate] = []
+    cursor = tail
+    while cursor != -1:
+        chain.append(ordered[cursor])
+        cursor = parent[cursor]
+    chain.reverse()
+    return chain, best[tail]
+
+
+def _sole_chain(chain: list[Candidate], candidates: list[Candidate]) -> bool:
+    """Is this short chain the document's numbering, or one fragment among
+    several?  Being rooted at 1 does not settle it -- a quoted statutory
+    provision numbered ``1.`` ``2.`` is rooted too.  Nothing left over may
+    carry a number this chain could have continued, and nothing left over may
+    form a run of its own."""
+    claimed = {offset for offset, _number, _score in chain}
+    last = chain[-1][1]
+    rest = sorted(item for item in candidates if item[0] not in claimed)
+    if any(1 <= number <= last + 1 for _offset, number, _score in rest):
+        return False
+    return all(
+        rest[index][1] <= rest[index - 1][1] for index in range(1, len(rest))
+    )
+
+
+def _endnote_shaped(chain: list[Candidate], length: int) -> bool:
+    if len(chain) < ENDNOTE_MIN_LABELS or length <= 0:
+        return False
+    threshold = ENDNOTE_TAIL_FRACTION * length
+    tail = sum(1 for offset, _number, _score in chain if offset > threshold)
+    return tail / len(chain) >= ENDNOTE_TAIL_SHARE
 
 
 def _paragraph_result(
     text: str,
     candidate: list[tuple[int, int]],
-    markers: list[tuple[int, int, str]],
-    style: str,
+    all_offsets: list[int],
 ) -> list[Paragraph]:
-    selected = (
-        _recover_heading_joined_paragraphs(text, candidate)
-        if style == "bracket"
-        else candidate
-    )
-    boundaries = sorted({
-        *(offset for offset, _number, marker_style in markers
-          if marker_style == style),
-        *(offset for offset, _number in selected),
-    })
-    return _numbered_index(text, selected, boundaries)
+    # The chain already carries whatever heading-joined labels it needed, so
+    # there is no post-hoc recovery pass to run here.
+    boundaries = sorted({*all_offsets, *(offset for offset, _number in candidate)})
+    return _numbered_index(text, candidate, boundaries)
 
 
 @lru_cache(maxsize=32)
@@ -221,33 +427,36 @@ def paragraph_index(text: str, *, min_run: int = 5) -> list[Paragraph]:
         bracket, dot, bare = match.groups()
         markers.append((match.start(), int(bracket or dot or bare),
                         "bracket" if bracket else "dot" if dot else "bare"))
-    hypotheses: list[tuple[str, list[tuple[int, int]], bool]] = []
+    # style -> (chain, all candidate offsets of that style)
+    hypotheses: list[tuple[str, list[Candidate], bool, float]] = []
+    offsets_by_style: dict[str, list[int]] = {}
     for style in ("bracket", "dot", "bare"):
-        styled = [(offset, number) for offset, number, marker_style in markers if marker_style == style]
-        for scope in monotone_scopes(styled):
-            if len(scope) >= min_run:
-                hypotheses.append((style, scope, False))
-            elif (
-                style == "bracket"
-                and len(scope) >= 2
-                and [number for _offset, number in scope]
-                == list(range(1, len(scope) + 1))
-            ):
-                hypotheses.append((style, scope, True))
+        candidates = _spine_candidates(text, markers, style)
+        offsets_by_style[style] = [offset for offset, _number, _score in candidates]
+        chain, score = _select_spine_chain(candidates)
+        # A ladder confined to the document's tail is a note block.
+        if len(chain) < 2 or _endnote_shaped(chain, len(text)):
+            continue
+        if len(chain) >= min_run:
+            hypotheses.append((style, chain, False, score))
+        elif style == "bracket" and _sole_chain(chain, candidates):
+            # Complete short [1]..[N] ladders are real structure in short
+            # orders, oral reasons and costs rulings, which min_run discards.
+            hypotheses.append((style, chain, True, score))
     if not hypotheses:
         return []
     rank = {"bracket": 2, "dot": 1, "bare": 0}
     full = [item for item in hypotheses if not item[2]]
     short = [item for item in hypotheses if item[2]]
-    primary = [item for item in full if item[1][0][1] <= 5]
-    strength = lambda item: (  # noqa: E731
-        len(item[1]), rank[item[0]], -item[1][0][1]
-    )
-    ordered = sorted(primary or full, key=strength, reverse=True)
+    # Every chain is rooted at paragraph 1, so the opening number no longer
+    # separates them: rank on the weight of the evidence instead.
+    strength = lambda item: (item[3], rank[item[0]])  # noqa: E731
+    ordered = sorted(full, key=strength, reverse=True)
     ordered += sorted(short, key=strength, reverse=True)
-    for style, candidate, short_complete in ordered:
-        out = _numbered_index(text, candidate, [offset for offset, _number, marker_style in markers
-                                                if marker_style == style])
+    for style, chain, short_complete, _score in ordered:
+        candidate = [(offset, number) for offset, number, _score_ in chain]
+        all_offsets = offsets_by_style[style]
+        out = _numbered_index(text, candidate, all_offsets)
         # A short numbered list followed by a long unnumbered tail otherwise
         # looks like a document-spanning paragraph sequence because the final
         # item inherits EOF as its boundary.  Marker coverage, not that tail,
@@ -268,7 +477,7 @@ def paragraph_index(text: str, *, min_run: int = 5) -> list[Paragraph]:
                 and (out[0][1] <= 1_200 or start_ratio <= 0.5)
                 and max(_word_count(item[3]) for item in out) >= 30
             ):
-                return _paragraph_result(text, candidate, markers, style)
+                return _paragraph_result(text, candidate, all_offsets)
             continue
         substantive_ratio = (
             sum(_word_count(item[3]) >= 12 for item in out) / len(out)
@@ -289,7 +498,7 @@ def paragraph_index(text: str, *, min_run: int = 5) -> list[Paragraph]:
         # Bare short ladders near the tail are usually lists/endnotes.
         if style == "bare" and (median_words < 20 or marker_span < 0.15 or start_ratio > 0.70):
             continue
-        return _paragraph_result(text, candidate, markers, style)
+        return _paragraph_result(text, candidate, all_offsets)
     return []
 
 
