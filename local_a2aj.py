@@ -66,6 +66,14 @@ class CorpusProgress:
     completed: int
     total: int
     message: str = ""
+    # `completed`/`total` measure progress through the whole snapshot, counting
+    # files that were reused from the installed copy at full size. That makes
+    # them useless as a download meter: on a small update they jump almost to
+    # `total` in seconds while nothing is transferred. These two count only
+    # bytes that actually have to come over the network, which is what an
+    # update is asking the user to wait for.
+    downloaded: int = 0
+    to_download: int = 0
 
 
 class InstallCancelled(Exception):
@@ -194,6 +202,57 @@ class LocalA2AJCorpus:
         remote = self.fetch_metadata(kind)
         return self.status(kind, remote)
 
+    def _reusable(self, item, active: Path, old_files: dict, old_local_files: dict) -> bool:
+        """Whether this file can be hard-linked from the installed copy.
+
+        The same test the install loop applies; kept in one place so the size
+        quoted to the user before a download cannot drift from the set of files
+        actually fetched.
+        """
+        prior = old_files.get(item.path)
+        prior_local = old_local_files.get(item.path)
+        if not prior or not prior_local or prior.get("sha256") != item.sha256:
+            return False
+        source = active / _safe_relative(item.path)
+        return source.is_file() and source.stat().st_size == prior_local.get("size")
+
+    def bytes_to_download(
+        self, kind: str, remote: Optional[RemoteSnapshot] = None
+    ) -> int:
+        """Bytes an update would actually fetch, ignoring what it can reuse.
+
+        An update to an installed corpus re-uses almost every file, so quoting
+        the snapshot's full size tells the user they are about to re-download
+        the entire corpus when they are not.
+
+        Stat-only, so it is cheap enough to call before starting. It counts a
+        partially downloaded file at full size rather than crediting the bytes
+        already in its .part, so the figure is an upper bound and the meter
+        never runs backwards.
+        """
+        kind = _kind(kind)
+        remote = remote or self.fetch_metadata(kind)
+        active = self.root / kind
+        old = self._read_manifest(kind)
+        old_files = {item["path"]: item for item in (old or {}).get("files") or ()}
+        old_local_files = {
+            item["path"]: item
+            for item in (
+                (old or {}).get("local_files") or (old or {}).get("files") or ()
+            )
+        }
+        token = hashlib.sha256(remote.revision.encode("utf-8")).hexdigest()[:16]
+        staging = self.root / f".{kind}-{token}.staging"
+        pending = 0
+        for item in remote.files:
+            if self._reusable(item, active, old_files, old_local_files):
+                continue
+            staged = staging / _safe_relative(item.path)
+            if staged.is_file() and staged.stat().st_size == item.size:
+                continue  # already fetched into staging by an earlier, paused run
+            pending += item.size
+        return pending
+
     def install_or_update(
         self,
         kind: str,
@@ -243,6 +302,10 @@ class LocalA2AJCorpus:
         backup = self.root / f".{kind}-{token}.backup"
         total = remote.size
         completed = 0
+        # What this run will actually pull over the network, so the meter shown
+        # to the user counts the wait rather than the corpus.
+        to_download = self.bytes_to_download(kind, remote)
+        downloaded = 0
         staging.mkdir(exist_ok=True)
         local_files = []
         try:
@@ -252,28 +315,28 @@ class LocalA2AJCorpus:
                 destination = staging / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 source = active / relative
-                prior = old_files.get(item.path)
-                prior_local = old_local_files.get(item.path)
-                if (
-                    prior
-                    and prior_local
-                    and prior.get("sha256") == item.sha256
-                    and source.is_file()
-                    and source.stat().st_size == prior_local.get("size")
-                ):
+                if self._reusable(item, active, old_files, old_local_files):
                     self._link_or_copy(source, destination)
-                    local_files.append(prior_local)
+                    local_files.append(old_local_files[item.path])
                     completed += item.size
-                    _progress(progress, kind, "reuse", completed, total, item.path)
+                    _progress(
+                        progress, kind, "reuse", completed, total, item.path,
+                        downloaded, to_download,
+                    )
                     continue
                 if not self._file_matches(destination, item):
                     self._download_file(
-                        remote, item, destination, completed, total, progress, cancelled
+                        remote, item, destination, completed, total, progress, cancelled,
+                        downloaded_base=downloaded, to_download=to_download,
                     )
+                    downloaded += item.size
                 local_files.append(asdict(item))
                 phase = "download"
                 completed += item.size
-                _progress(progress, kind, phase, completed, total, item.path)
+                _progress(
+                    progress, kind, phase, completed, total, item.path,
+                    downloaded, to_download,
+                )
 
             self._check_cancel(cancelled)
             manifest = {
@@ -304,9 +367,15 @@ class LocalA2AJCorpus:
                     if obsolete.is_dir() and not obsolete.is_symlink():
                         shutil.rmtree(obsolete)
             if rebuild_runtime:
-                _progress(progress, kind, "index", total, total, "Preparing SQLite corpus")
+                _progress(
+                    progress, kind, "index", total, total,
+                    "Preparing SQLite corpus", downloaded, to_download,
+                )
                 self.build_runtime_database()
-            _progress(progress, kind, "complete", total, total, remote.revision)
+            _progress(
+                progress, kind, "complete", total, total, remote.revision,
+                downloaded, to_download,
+            )
             return self.status(kind, remote)
         except BaseException:
             # Keep deterministic staging and .part files so the same revision resumes.
@@ -657,6 +726,7 @@ class LocalA2AJCorpus:
     def _download_file(
         self, remote: RemoteSnapshot, item: CorpusFile, destination: Path,
         base: int, total: int, progress: Optional[ProgressCallback], cancelled: Optional[CancelCallback],
+        *, downloaded_base: int = 0, to_download: int = 0,
     ) -> None:
         url = f"{HF_RESOLVE}/{remote.repository}/resolve/{quote(remote.revision, safe='')}/{quote(item.path, safe='/')}"
         part = destination.with_suffix(destination.suffix + ".part")
@@ -683,7 +753,10 @@ class LocalA2AJCorpus:
                     output.write(chunk)
                     digest.update(chunk)
                     written += len(chunk)
-                    _progress(progress, remote.kind, "download", base + written, total, item.path)
+                    _progress(
+                        progress, remote.kind, "download", base + written, total,
+                        item.path, downloaded_base + written, to_download,
+                    )
         if written != item.size:
             raise ValueError(f"Downloaded A2AJ file failed verification: {item.path}")
         if digest.hexdigest() != item.sha256:
@@ -763,9 +836,12 @@ def _safe_relative(value: str) -> Path:
 def _progress(
     callback: Optional[ProgressCallback], kind: str, phase: str,
     completed: int, total: int, message: str,
+    downloaded: int = 0, to_download: int = 0,
 ) -> None:
     if callback:
-        callback(CorpusProgress(kind, phase, completed, total, message))
+        callback(CorpusProgress(
+            kind, phase, completed, total, message, downloaded, to_download,
+        ))
 
 
 def _json_value(value):

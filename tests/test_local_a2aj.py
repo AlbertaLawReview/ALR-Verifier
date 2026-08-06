@@ -42,7 +42,8 @@ class CopyingCorpus(LocalA2AJCorpus):
         self.sources = sources
         self.downloaded = []
 
-    def _download_file(self, remote, item, destination, base, total, progress, cancelled):
+    def _download_file(self, remote, item, destination, base, total, progress,
+                       cancelled, **kwargs):
         self._check_cancel(cancelled)
         shutil.copy2(self.sources[item.sha256], destination)
         self.downloaded.append(item.path)
@@ -469,3 +470,74 @@ def test_packaged_a2aj_lifecycle_fresh_reboot_and_update(tmp_path):
     ] == "updated text"
     assert not list(root.glob(".cases-*.staging"))
     assert not list(root.glob(".cases-*.backup"))
+
+
+def test_update_meter_counts_only_the_bytes_it_will_fetch(tmp_path):
+    """An update must not quote the whole corpus as the download size.
+
+    install_or_update's completed/total walk every file and count reused ones
+    at full size, so on a small update they reach nearly total in seconds.
+    Reporting that as "x of 4.9 GB" told the user the entire corpus was coming
+    down again. to_download/downloaded count only what crosses the network.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    big = _parquet(source / "big.parquet", "2024 SCC 1", "Unchanged Case", "x" * 4000)
+    old_small = _parquet(source / "old.parquet", "2024 SCC 2", "Changed Case", "old")
+    new_small = _parquet(source / "new.parquet", "2024 SCC 2", "Changed Case", "new text")
+    corpus = CopyingCorpus(tmp_path / "corpus", {
+        big.sha256: source / "big.parquet",
+        old_small.sha256: source / "old.parquet",
+        new_small.sha256: source / "new.parquet",
+    })
+
+    initial = RemoteSnapshot("cases", "a2aj/test", "rev-1", "2026-01-01", (big, old_small))
+    corpus.install_or_update("cases", remote=initial)
+
+    changed = CorpusFile(old_small.path, new_small.sha256, new_small.size)
+    update = RemoteSnapshot("cases", "a2aj/test", "rev-2", "2026-01-08", (big, changed))
+
+    # Only the changed file is pending, not the whole snapshot.
+    pending = corpus.bytes_to_download("cases", update)
+    assert pending == changed.size
+    assert pending < update.size, "the unchanged file must not be counted"
+
+    seen = []
+    corpus.downloaded.clear()
+    corpus.install_or_update("cases", remote=update, progress=seen.append)
+
+    assert corpus.downloaded == [old_small.path]
+    assert {record.to_download for record in seen} == {pending}
+    # The meter never overshoots its own denominator, and ends at it.
+    assert all(record.downloaded <= record.to_download for record in seen)
+    assert seen[-1].downloaded == pending
+    # The reused file is credited to completed/total but never to the download.
+    reuse = [record for record in seen if record.phase == "reuse"]
+    assert reuse and all(record.downloaded == 0 for record in reuse)
+    assert seen[-1].completed == update.size != pending
+
+
+def test_a_paused_download_is_not_re_counted_when_resumed(tmp_path):
+    """Bytes already staged by an interrupted run are not quoted again."""
+    source = tmp_path / "source"
+    source.mkdir()
+    first = _parquet(source / "first.parquet", "2024 SCC 1", "First", "first text")
+    second = _parquet(source / "second.parquet", "2024 SCC 2", "Second", "second text")
+    corpus = CopyingCorpus(tmp_path / "corpus", {
+        first.sha256: source / "first.parquet",
+        second.sha256: source / "second.parquet",
+    })
+    remote = RemoteSnapshot("cases", "a2aj/test", "rev-1", "2026-01-01", (first, second))
+
+    assert corpus.bytes_to_download("cases", remote) == first.size + second.size
+
+    # Stop once the first file is staged. _download_file checks cancellation
+    # itself, so a fixed sequence of answers would fire before anything landed.
+    with pytest.raises(InstallCancelled):
+        corpus.install_or_update(
+            "cases", remote=remote, cancelled=lambda: len(corpus.downloaded) >= 1
+        )
+    assert len(corpus.downloaded) == 1
+
+    # Whatever landed in staging is not quoted to the user a second time.
+    assert corpus.bytes_to_download("cases", remote) < first.size + second.size

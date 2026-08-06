@@ -415,6 +415,9 @@ def test_a2aj_install_clears_cache_after_each_completed_corpus():
     )
     corpus = Mock()
     corpus.fetch_metadata.side_effect = snapshots
+    # Asked up front so the meter can quote the bytes actually coming down
+    # rather than the size of the whole corpus.
+    corpus.bytes_to_download.side_effect = [4, 8]
     corpus.install_or_update.side_effect = [None, RuntimeError("laws failed")]
     cancel = Mock()
     cancel.is_set.return_value = False
@@ -493,3 +496,81 @@ def test_frozen_macos_uses_writable_appdata_output(monkeypatch, tmp_path):
     monkeypatch.setattr(gui.sys, "frozen", True, raising=False)
     monkeypatch.setattr(gui.paths, "data_dir", lambda: tmp_path)
     assert gui._default_output_folder() == str(tmp_path / "CHECKED_EDITS")
+
+
+def _corpus_ui_stub(installed=True, statuses=None):
+    """Minimal stand-in for the corpus row of the settings pane."""
+    status_var, button = Mock(), Mock()
+    stub = SimpleNamespace(
+        a2aj_corpus_status_var=status_var,
+        a2aj_corpus_btn=button,
+        local_only_var=SimpleNamespace(get=lambda: False, set=Mock()),
+        _apply_local_only_ui=Mock(),
+        _a2aj_installing=False,
+        _a2aj_statuses=lambda: statuses or (
+            SimpleNamespace(installed=True, size=2_400_000_000),
+            SimpleNamespace(installed=True, size=2_500_000_000),
+        ),
+        _a2aj_corpus_installed=lambda: installed,
+        _start_a2aj_install=Mock(name="start"),
+        _check_a2aj_updates=Mock(name="check"),
+        _format_gb=gui.ALRQuoteVerifierGUI._format_gb,
+    )
+    return stub, status_var, button
+
+
+def test_update_progress_quotes_the_download_not_the_whole_corpus():
+    """An update fetches a fraction of the corpus; say so.
+
+    completed/total count reused files at full size, so quoting them read
+    "0 of 4.9 GB" at the start of an update and then advanced at a rate that
+    plainly did not belong to a 4.9 GB download.
+    """
+    stub, status_var, _button = _corpus_ui_stub()
+    gui.ALRQuoteVerifierGUI._show_a2aj_progress(
+        stub, completed=0, total=4_900_000_000,
+        downloaded=60_000_000, to_download=300_000_000,
+        phase="download", message="SCC/train.parquet",
+    )
+    label = status_var.set.call_args[0][0]
+    assert "4.9 GB" not in label, "an update must not imply re-downloading the corpus"
+    assert "0.3 GB" in label and "0.1 GB" in label
+    assert "20%" in label  # 60 of 300 MB, against the download it is actually doing
+
+
+def test_progress_says_checking_when_there_is_nothing_to_download():
+    """With everything reused, a racing percentage is verification, not speed."""
+    stub, status_var, _button = _corpus_ui_stub()
+    gui.ALRQuoteVerifierGUI._show_a2aj_progress(
+        stub, completed=2_450_000_000, total=4_900_000_000,
+        downloaded=0, to_download=0, phase="reuse", message="SCC/train.parquet",
+    )
+    label = status_var.set.call_args[0][0]
+    assert "Checking installed files" in label and "50%" in label
+    assert "of 4.9 GB" not in label
+
+
+def test_paused_download_offers_resume_rather_than_check_for_updates():
+    """The button must be the one the message tells you to press.
+
+    Pausing an update to an installed corpus left the label saying "press
+    Install to resume" while the button underneath still read "Check for
+    updates…", because the corpus still looked installed.
+    """
+    stub, status_var, button = _corpus_ui_stub(installed=True)
+    gui.ALRQuoteVerifierGUI._refresh_a2aj_corpus_ui(
+        stub, message="Download paused", paused=True,
+    )
+    assert status_var.set.call_args[0][0] == "Download paused"
+    text = button.config.call_args[1]["text"]
+    assert text == "Resume download…"
+    assert "Check for updates" not in text and "Install" not in text
+
+    button.config.call_args[1]["command"]()
+    stub._start_a2aj_install.assert_called_once_with(confirmed=True)
+
+
+def test_installed_and_current_corpus_still_offers_a_check():
+    stub, _status_var, button = _corpus_ui_stub(installed=True)
+    gui.ALRQuoteVerifierGUI._refresh_a2aj_corpus_ui(stub)
+    assert button.config.call_args[1]["text"] == "Check for updates…"

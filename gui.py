@@ -2223,7 +2223,7 @@ class ALRQuoteVerifierGUI:
     def _format_gb(size: int) -> str:
         return f"{size / 1_000_000_000:.1f} GB"
 
-    def _refresh_a2aj_corpus_ui(self, remote_statuses=None, message=""):
+    def _refresh_a2aj_corpus_ui(self, remote_statuses=None, message="", paused=False):
         statuses = self._a2aj_statuses()
         installed = self._a2aj_corpus_installed()
         source_installed = all(status.installed for status in statuses)
@@ -2244,7 +2244,16 @@ class ALRQuoteVerifierGUI:
         self.a2aj_corpus_status_var.set(label)
         if not self._a2aj_installing:
             stale = bool(remote_statuses and any(status.stale for status in remote_statuses))
-            if installed:
+            if paused:
+                # A paused run leaves the partly-fetched snapshot in staging, so
+                # the only useful action is to carry on. Previously the label
+                # said "press Install to resume" while the button underneath it
+                # still read "Check for updates…", because an interrupted update
+                # to an installed corpus still looks installed.
+                button_text = "Resume download…"
+                # Already confirmed before the first byte; do not re-ask.
+                button_command = lambda: self._start_a2aj_install(confirmed=True)
+            elif installed:
                 button_text = "Update…" if stale else "Check for updates…"
                 button_command = (
                     self._start_a2aj_install
@@ -2402,12 +2411,28 @@ class ALRQuoteVerifierGUI:
                     corpus.fetch_metadata("laws"),
                 )
                 total = sum(snapshot.size for snapshot in snapshots)
+                # Ask both partitions what they will actually fetch before
+                # starting, so the figure shown never implies re-downloading a
+                # corpus that is mostly already on disk.
+                pending = sum(
+                    corpus.bytes_to_download(snapshot.kind, snapshot)
+                    for snapshot in snapshots
+                )
                 offset = 0
+                fetched = 0
                 for snapshot in snapshots:
-                    def progress(item, base=offset):
+                    # install_or_update reports bytes fetched within its own
+                    # partition; carry the running total across both.
+                    partition_fetched = [0]
+
+                    def progress(item, base=offset, base_fetched=fetched,
+                                 seen=partition_fetched):
+                        seen[0] = item.downloaded
                         self.root.after(
                             0, self._show_a2aj_progress,
-                            base + item.completed, total, item.message,
+                            base + item.completed, total,
+                            base_fetched + item.downloaded, pending,
+                            item.phase, item.message,
                         )
                     corpus.install_or_update(
                         snapshot.kind, remote=snapshot, progress=progress,
@@ -2416,6 +2441,7 @@ class ALRQuoteVerifierGUI:
                     )
                     aqv.a2aj_client.clear_memory_cache()
                     offset += snapshot.size
+                    fetched += partition_fetched[0]
                 self.root.after(
                     0, self.a2aj_corpus_status_var.set,
                     "Preparing shared SQLite corpusâ€¦",
@@ -2426,7 +2452,7 @@ class ALRQuoteVerifierGUI:
             except InstallCancelled:
                 self.root.after(
                     0, self._finish_a2aj_install, False,
-                    "Download paused · press Install to resume",
+                    "Download paused", True,
                 )
             except Exception as exc:
                 self.root.after(
@@ -2436,20 +2462,39 @@ class ALRQuoteVerifierGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_a2aj_progress(self, completed, total, message):
-        percent = int(completed * 100 / total) if total else 0
+    def _show_a2aj_progress(
+        self, completed, total, downloaded=0, to_download=0, phase="", message="",
+    ):
+        """Report the download, not the corpus.
+
+        `completed` walks the whole snapshot and counts reused files at full
+        size, so on an update it reaches most of `total` in seconds without
+        fetching anything. Quoting it as "x of 4.9 GB" told the user the entire
+        corpus was coming down again. The bytes actually being fetched are the
+        wait worth showing, and verification gets its own wording so a fast-
+        moving percentage is not mistaken for a fast download.
+        """
         partition = str(message or "").split("/", 1)[0]
+        if to_download:
+            percent = int(min(downloaded, to_download) * 100 / to_download)
+            self.a2aj_corpus_status_var.set(
+                f"Downloading · {percent}% · {self._format_gb(downloaded)} of "
+                f"{self._format_gb(to_download)} · {partition}"
+            )
+            return
+        # Nothing to fetch: everything is reused from the installed copy and
+        # this pass is just verifying and re-linking it.
+        percent = int(completed * 100 / total) if total else 0
         self.a2aj_corpus_status_var.set(
-            f"{percent}% · {self._format_gb(completed)} of "
-            f"{self._format_gb(total)} · {partition}"
+            f"Checking installed files · {percent}% · {partition}"
         )
 
-    def _finish_a2aj_install(self, success, message):
+    def _finish_a2aj_install(self, success, message, paused=False):
         enable = success and self._enable_local_only_after_install
         self._a2aj_installing = False
         self._enable_local_only_after_install = False
         self.a2aj_corpus_btn.config(state=tk.NORMAL)
-        self._refresh_a2aj_corpus_ui(message=message)
+        self._refresh_a2aj_corpus_ui(message=message, paused=paused)
         if enable:
             self.local_only_var.set(True)
             self._on_local_only_toggle()
