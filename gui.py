@@ -2286,11 +2286,23 @@ class ALRQuoteVerifierGUI:
         def worker():
             try:
                 corpus = aqv.a2aj_client.get_local_corpus()
-                statuses = (
-                    corpus.check_for_updates("cases"),
-                    corpus.check_for_updates("laws"),
+                # Fetch each snapshot once and reuse it, so the size quoted in
+                # the prompt is measured against the same revision the status
+                # was read from.
+                snapshots = (
+                    corpus.fetch_metadata("cases"),
+                    corpus.fetch_metadata("laws"),
                 )
-                self.root.after(0, self._finish_a2aj_update_check, statuses, "")
+                statuses = tuple(
+                    corpus.status(snapshot.kind, snapshot) for snapshot in snapshots
+                )
+                pending = sum(
+                    corpus.bytes_to_download(snapshot.kind, snapshot)
+                    for snapshot in snapshots
+                )
+                self.root.after(
+                    0, self._finish_a2aj_update_check, statuses, "", manual, pending,
+                )
             except Exception as exc:
                 self.root.after(
                     0, self._finish_a2aj_update_check, None,
@@ -2299,11 +2311,35 @@ class ALRQuoteVerifierGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_a2aj_update_check(self, statuses, message):
+    def _finish_a2aj_update_check(self, statuses, message, manual=False, pending=0):
         self._a2aj_checking = False
-        if statuses is not None and not any(status.stale for status in statuses):
+        stale = statuses is not None and any(status.stale for status in statuses)
+        if statuses is not None and not stale:
             message = f"Installed · {self._format_gb(sum(s.size for s in statuses))} · up to date"
         self._refresh_a2aj_corpus_ui(statuses, message)
+        # Pressing "Check for updates…" and being told one exists left the user
+        # to find the button had relabelled itself "Update…" and press again.
+        # Asking outright is one click, and it is the only place the size can be
+        # shown before committing to the download rather than during it.
+        if manual and stale and self._offer_a2aj_update(pending):
+            self._start_a2aj_install(confirmed=True)
+
+    def _offer_a2aj_update(self, pending: int) -> bool:
+        if pending:
+            detail = (
+                f"About {self._format_gb(pending)} needs to be downloaded; the "
+                "rest is reused from the copy already installed."
+            )
+        else:
+            detail = (
+                "Every file is already on this computer. Updating only "
+                "re-verifies them and rebuilds the local index."
+            )
+        return messagebox.askyesno(
+            "A2AJ update available",
+            f"A newer A2AJ snapshot is available.\n\n{detail}\n\nUpdate now?",
+            parent=self.root,
+        )
 
     def _offer_local_corpus_install(self) -> bool:
         result = {"install": False}

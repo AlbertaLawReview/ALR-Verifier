@@ -2227,6 +2227,18 @@ def build_global_text(paragraphs: List[Dict[str, Any]], sep: str = "\n\n"):
         global_parts.append(p["text"])
         paragraph_end = pos + len(p["text"])
 
+        # A DOCX paragraph is its own boundary. A PDF's is not: the engine
+        # recovers layout paragraphs close to line granularity, so capping a
+        # proposition at one would cut it to a line. Where the PDF adapter
+        # found the document's own numbered paragraphs it records the span of
+        # the numbered paragraph this line belongs to, and that is the
+        # boundary worth capping at.
+        block_span = p.get("pdf_block_span")
+        if block_span:
+            limit_start, limit_end = int(block_span[0]), int(block_span[1])
+        else:
+            limit_start, limit_end = pos, paragraph_end
+
         for a in p["anchors"]:
             anchors.append(
                 {
@@ -2234,8 +2246,8 @@ def build_global_text(paragraphs: List[Dict[str, Any]], sep: str = "\n\n"):
                     "para_index": i,
                     "para_offset": a["offset"],
                     "global_pos": pos + a["offset"],
-                    "paragraph_start": pos,
-                    "paragraph_end": paragraph_end,
+                    "paragraph_start": limit_start,
+                    "paragraph_end": limit_end,
                     "limit_to_paragraph": bool(
                         p.get("pdf_proposition_limit")
                     ),
@@ -6301,6 +6313,38 @@ def _clean_anchor_paragraph_bounds(
     return raw_to_clean[raw_start], raw_to_clean[raw_end]
 
 
+def _preferred_anchors(
+    anchors_sorted: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Drop a footnote's out-of-argument anchors when it also has a real one.
+
+    Both strategies represent a footnote by its first anchor. In a PDF the
+    engine sometimes pairs a note to a number that is not a reference at all --
+    a page number trailing a table-of-contents dot leader, a stamp on a
+    scanned exhibit -- and being first, that one wins and the proposition
+    becomes a row of dots.
+
+    Where the document's numbered paragraphs are known, they say which anchors
+    are inside the argument. If a footnote has one there, the ones outside it
+    are not references to weigh against it. A document with no numbered
+    paragraphs marks nothing, so nothing here changes: that includes every
+    DOCX, whose anchors are authored rather than inferred.
+    """
+    inside = {
+        int(a["footnote_id"])
+        for a in anchors_sorted
+        if a.get("limit_to_paragraph")
+    }
+    if not inside:
+        return anchors_sorted
+    return [
+        a
+        for a in anchors_sorted
+        if a.get("limit_to_paragraph")
+        or int(a["footnote_id"]) not in inside
+    ]
+
+
 def build_anchor_propositions(
     clean_global: str,
     anchors: List[Dict[str, Any]],
@@ -6317,6 +6361,8 @@ def build_anchor_propositions(
     out: Dict[int, Dict[str, Any]] = {}
 
     intro_cut = _introduction_cutoff(clean_global)
+
+    anchors_sorted = _preferred_anchors(anchors_sorted)
 
     if PROPOSITION_MODE == "passage_since_prior_note":
         ordered: List[Tuple[int, int, Dict[str, Any]]] = []

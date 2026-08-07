@@ -124,3 +124,104 @@ def test_pdf_line_wrapped_quote_uses_passage_context(monkeypatch):
     assert "The court held that" not in sentence[1]["proposition_text"]
     assert passage[1]["proposition_text"] == 'The court held that "quoted words"1'
     assert passage[2]["proposition_text"] == ". Next proposition2"
+
+
+# --- numbered-paragraph capping for PDFs ------------------------------------
+#
+# The engine hands back layout paragraphs close to line granularity, so the
+# unit a proposition may be capped at is the document's own numbered
+# paragraph, recovered by the monotone spine detector.
+
+
+def _lines(*texts):
+    """Layout paragraphs the way the engine emits them: one per line."""
+    return [{"text": text, "anchors": []} for text in texts]
+
+
+def _numbered_brief(count=8, lines_each=3):
+    """A brief whose paragraphs are numbered 1..count, each split over lines."""
+    out = []
+    for number in range(1, count + 1):
+        out.append(
+            f"{number}. Paragraph {number} opens here and runs on at some"
+        )
+        for extra in range(lines_each - 1):
+            out.append(
+                f"length about matter {number} continuing on line {extra} of it"
+            )
+    return _lines(*out)
+
+
+def test_unnumbered_pdf_is_left_completely_alone():
+    paragraphs = _lines("A heading", "Some prose with no numbering at all.")
+
+    assert pdf_adapter.mark_numbered_paragraphs(paragraphs) == 0
+    assert all("pdf_proposition_limit" not in p for p in paragraphs)
+
+
+def test_numbered_paragraph_caps_the_passage_not_the_line():
+    import alr_quote_verifier
+
+    paragraphs = _numbered_brief()
+    found = pdf_adapter.mark_numbered_paragraphs(paragraphs)
+    assert found == 8
+
+    # An anchor on the last line of paragraph 5 must be capped at the start of
+    # paragraph 5 -- not at its own line, and not at paragraph 4.
+    target = next(
+        i for i, p in enumerate(paragraphs)
+        if p.get("pdf_block_id") == 5 and paragraphs[i + 1].get("pdf_block_id") == 6
+    )
+    paragraphs[target]["anchors"] = [
+        {"footnote_id": 1, "offset": len(paragraphs[target]["text"])}
+    ]
+
+    global_text, _starts, anchors = alr_quote_verifier.build_global_text(paragraphs)
+    anchor = anchors[0]
+    assert anchor["limit_to_paragraph"] is True
+    capped = global_text[anchor["paragraph_start"]:anchor["paragraph_end"]]
+    assert capped.startswith("5. Paragraph 5 opens here")
+    assert "6. Paragraph 6" not in capped
+    assert "4. Paragraph 4" not in capped
+    # the cap spans the whole numbered paragraph, not the anchor's own line
+    assert len(capped) > len(paragraphs[target]["text"])
+
+
+def test_docx_paragraphs_keep_their_own_bounds():
+    """Nothing marked means the paragraph is its own boundary, as before."""
+    import alr_quote_verifier
+
+    paragraphs = [
+        {"text": "First paragraph.", "anchors": []},
+        {"text": "Second paragraph.", "anchors": [{"footnote_id": 1, "offset": 6}]},
+    ]
+    _text, _starts, anchors = alr_quote_verifier.build_global_text(paragraphs)
+
+    assert anchors[0]["limit_to_paragraph"] is False
+    assert anchors[0]["paragraph_start"] == len("First paragraph.") + 2
+    assert anchors[0]["paragraph_end"] == len("First paragraph.\n\nSecond paragraph.")
+
+
+def test_anchor_outside_the_argument_loses_to_the_real_one():
+    """A note mis-paired into a table of contents must not define its passage."""
+    import alr_quote_verifier
+
+    toc = {"footnote_id": 1, "global_pos": 10, "limit_to_paragraph": False}
+    real = {"footnote_id": 1, "global_pos": 900, "limit_to_paragraph": True}
+    other = {"footnote_id": 2, "global_pos": 50, "limit_to_paragraph": False}
+
+    kept = alr_quote_verifier._preferred_anchors([toc, other, real])
+
+    assert real in kept and toc not in kept
+    # a footnote with no in-argument anchor keeps the one it has
+    assert other in kept
+
+
+def test_preferred_anchors_is_a_no_op_without_numbered_paragraphs():
+    import alr_quote_verifier
+
+    anchors = [
+        {"footnote_id": 1, "global_pos": 10},
+        {"footnote_id": 1, "global_pos": 90},
+    ]
+    assert alr_quote_verifier._preferred_anchors(anchors) == anchors

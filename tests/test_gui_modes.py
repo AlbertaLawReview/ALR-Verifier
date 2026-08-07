@@ -331,7 +331,11 @@ def test_downloaded_corpus_without_runtime_offers_index_preparation():
 
 def test_manual_a2aj_update_check_works_in_local_only_and_shows_busy_state():
     corpus = Mock()
-    corpus.check_for_updates.side_effect = ["cases", "laws"]
+    corpus.fetch_metadata.side_effect = [
+        SimpleNamespace(kind="cases"), SimpleNamespace(kind="laws")
+    ]
+    corpus.status.side_effect = ["cases", "laws"]
+    corpus.bytes_to_download.side_effect = [3, 4]
     stub = SimpleNamespace(
         _a2aj_installing=False,
         _a2aj_checking=False,
@@ -361,8 +365,59 @@ def test_manual_a2aj_update_check_works_in_local_only_and_shows_busy_state():
     )
     stub.a2aj_corpus_btn.config.assert_called_once_with(state=gui.tk.DISABLED)
     stub.root.after.assert_called_once_with(
-        0, stub._finish_a2aj_update_check, ("cases", "laws"), ""
+        0, stub._finish_a2aj_update_check, ("cases", "laws"), "", True, 7
     )
+
+
+def test_manual_check_finding_an_update_offers_it_without_a_second_click():
+    """Finding an update must ask, not silently relabel the button."""
+    stale = (SimpleNamespace(stale=True, size=1), SimpleNamespace(stale=False, size=2))
+    stub = SimpleNamespace(
+        _a2aj_checking=True,
+        _refresh_a2aj_corpus_ui=Mock(),
+        _offer_a2aj_update=Mock(return_value=True),
+        _start_a2aj_install=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._finish_a2aj_update_check(
+        stub, stale, "", manual=True, pending=460_000_000
+    )
+
+    stub._offer_a2aj_update.assert_called_once_with(460_000_000)
+    # already confirmed by the prompt; must not re-ask
+    stub._start_a2aj_install.assert_called_once_with(confirmed=True)
+
+
+def test_declining_the_offer_starts_nothing():
+    stale = (SimpleNamespace(stale=True, size=1),)
+    stub = SimpleNamespace(
+        _a2aj_checking=True,
+        _refresh_a2aj_corpus_ui=Mock(),
+        _offer_a2aj_update=Mock(return_value=False),
+        _start_a2aj_install=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._finish_a2aj_update_check(
+        stub, stale, "", manual=True, pending=1
+    )
+
+    stub._start_a2aj_install.assert_not_called()
+
+
+def test_background_update_check_never_prompts():
+    """The startup check runs unasked; it must not throw up a dialog."""
+    stale = (SimpleNamespace(stale=True, size=1),)
+    stub = SimpleNamespace(
+        _a2aj_checking=True,
+        _refresh_a2aj_corpus_ui=Mock(),
+        _offer_a2aj_update=Mock(),
+        _start_a2aj_install=Mock(),
+    )
+
+    gui.ALRQuoteVerifierGUI._finish_a2aj_update_check(stub, stale, "")
+
+    stub._offer_a2aj_update.assert_not_called()
+    stub._start_a2aj_install.assert_not_called()
 
 
 def test_automatic_a2aj_update_check_skips_local_only():
