@@ -9321,7 +9321,7 @@ def write_workbook(data: Dict[str, Any], output_path: str) -> None:
             "Footnote Text": 60,
             "Quotes and proposition": 70,
             "Citation": 60,
-            "Automatic  Checking  System â–º": 12,
+            "Automatic  Checking  System ►": 12,
             "Corrected quote": 55,
             "ref_resolution_notes": 25,
         }
@@ -9521,7 +9521,7 @@ def apply_cell_formatting(xlsx_path: str, *, save: bool = True) -> Optional[Any]
         "Footnote Text",
         "Quotes and proposition",
         "Citation",
-        "Automatic  Checking  System â–º",
+        "Automatic  Checking  System ►",
         "Corrected quote",
     ]
     display_col_indexes = [idx for idx in (_col(name) for name in display_col_names) if idx]

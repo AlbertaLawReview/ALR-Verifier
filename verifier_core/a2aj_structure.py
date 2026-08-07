@@ -69,16 +69,16 @@ PROVISION_IN_MAP_KEY_RE = re.compile(
     r")\b"
 )
 MARKDOWN_RANGE_CONTINUATION_RE = re.compile(
-    r"^[ \t]*#{1,6}[ \t]+.*(?:[ \t](?:to|Ã )|[-â€“â€”])[ \t]*$",
+    r"^[ \t]*#{1,6}[ \t]+.*(?:[ \t](?:to|à)|[-–—])[ \t]*$",
     re.I,
 )
 SHORT_ROOT_ALONE_RE = re.compile(r"^[ \t]*([12])[ \t]*$", re.MULTILINE)
 SHORT_ROOT_STATUS_RE = re.compile(
-    r"^(?:\[\s*)?(?:repealed|revoked|abrog(?:ated|Ã©|Ã©e|Ã©s|Ã©es)|"
+    r"^(?:\[\s*)?(?:repealed|revoked|abrog(?:ated|é|ée|és|ées)|"
     r"renumbered|spent|not (?:yet )?in force|omitted)\b",
     re.I,
 )
-SHORT_ROOT_HEADING_RE = re.compile(r"^(?:(?:[\"'â€œÂ«]\s*)?[A-Z]|\(\d+\))")
+SHORT_ROOT_HEADING_RE = re.compile(r"^(?:(?:[\"'“«]\s*)?[A-Z]|\(\d+\))")
 STATUS_RANGE_RE = re.compile(
     r"^[ \t]*(?:\*\*)?(?P<from>\d{1,4})"
     r"(?:[ \t]+(?:to|through|and|à|a|et)[ \t]+|[ \t]*[-–—][ \t]*)"
@@ -572,7 +572,7 @@ def page_structure(
 def allows_hyphenated_provisions(instrument_name: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:rules?|regulations?|r[eÃ¨]glements?)\b",
+            r"\b(?:rules?|regulations?|r[eè]glements?)\b",
             instrument_name or "",
             re.IGNORECASE,
         )
@@ -990,8 +990,8 @@ def ordered_section_map_entries(
     ) -> int:
         left_label = left[0].strip()
         right_label = right[0].strip()
-        left_preamble = left_label.casefold() in {"preamble", "prÃ©ambule"}
-        right_preamble = right_label.casefold() in {"preamble", "prÃ©ambule"}
+        left_preamble = left_label.casefold() in {"preamble", "préambule"}
+        right_preamble = right_label.casefold() in {"preamble", "préambule"}
         if left_preamble != right_preamble:
             return -1 if left_preamble else 1
         left_section = bool(PROVISION_LABEL_RE.fullmatch(left_label))
@@ -1018,7 +1018,7 @@ def provision_labels_from_map_key(label: str) -> set[str]:
         return {value}
     labels = set(PROVISION_IN_MAP_KEY_RE.findall(value))
     if len(labels) < 2 or not re.search(
-        r"\b(?:to|through|and|Ã |a|et)\b|[-â€“â€”]",
+        r"\b(?:to|through|and|à|a|et)\b|[-–—]",
         value,
         re.I,
     ):

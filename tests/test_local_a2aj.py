@@ -417,6 +417,100 @@ def test_cancelled_runtime_build_removes_partial_database(tmp_path):
     assert not database.with_suffix(database.suffix + ".new").exists()
 
 
+def _dataset_parquet(root, dataset, citation, name, text):
+    """A source file at the path a real manifest uses: ``DATASET/train.parquet``."""
+    folder = root / dataset
+    folder.mkdir(parents=True, exist_ok=True)
+    item = _parquet(folder / "train.parquet", citation, name, text)
+    return CorpusFile(f"{dataset}/train.parquet", item.sha256, item.size)
+
+
+def _wide_parquet(root, dataset, rows):
+    folder = root / dataset
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "train.parquet"
+    with duckdb.connect() as connection:
+        connection.execute(
+            "CREATE TABLE rows AS SELECT ? dataset, "
+            "'2024 SCC ' || i citation_en, 'Case ' || i name_en, "
+            "'text' unofficial_text_en FROM range(?) t(i)",
+            [dataset, rows],
+        )
+        connection.table("rows").write_parquet(str(path))
+    content = path.read_bytes()
+    return CorpusFile(
+        f"{dataset}/train.parquet", hashlib.sha256(content).hexdigest(), len(content)
+    )
+
+
+def _manifest(source, *files, revision="rev"):
+    (source / "manifest.json").write_text(
+        json.dumps({"revision": revision, "files": [asdict(f) for f in files]}),
+        encoding="utf-8",
+    )
+
+
+def test_runtime_build_meters_parquet_bytes_not_file_count(tmp_path):
+    """The datasets differ by orders of magnitude in size.
+
+    Counting files makes the meter sit still through the one dataset that is
+    most of the wait and then leap through a dozen small ones.
+    """
+    source = tmp_path / "source" / "cases"
+    source.mkdir(parents=True)
+    big = _dataset_parquet(source, "SCC", "2024 SCC 1", "One", "sentence. " * 40000)
+    small = _dataset_parquet(source, "TCC", "2024 TCC 1", "Two", "two")
+    _manifest(source, big, small)
+    corpus = LocalA2AJCorpus(tmp_path / "source", runtime_db=tmp_path / "a2aj.sqlite")
+
+    seen = []
+    corpus.build_runtime_database(progress=seen.append)
+
+    assert big.size > small.size, "fixture must have an uneven split to be meaningful"
+    assert {item.total for item in seen} == {big.size + small.size}
+    assert {item.message for item in seen} >= {"SCC", "TCC"}
+    # Finishing the big dataset must move the meter by the big dataset's bytes,
+    # which a file-count meter would have reported as 1 of 2.
+    assert max(item.completed for item in seen if item.message == "SCC") == big.size
+
+
+def test_runtime_build_ends_on_an_index_phase_at_full_progress(tmp_path):
+    """Index creation happens after the last byte is read and takes real time."""
+    source = tmp_path / "source" / "cases"
+    source.mkdir(parents=True)
+    only = _dataset_parquet(source, "SCC", "2024 SCC 1", "One", "text")
+    _manifest(source, only)
+    corpus = LocalA2AJCorpus(tmp_path / "source", runtime_db=tmp_path / "a2aj.sqlite")
+
+    seen = []
+    corpus.build_runtime_database(progress=seen.append)
+
+    assert seen[-1].phase == "optimize"
+    assert seen[-1].completed == seen[-1].total == only.size
+
+
+def test_cancel_is_honoured_partway_through_a_single_dataset(tmp_path):
+    """Checking once per file makes Cancel wait out the largest dataset."""
+    source = tmp_path / "source" / "cases"
+    source.mkdir(parents=True)
+    only = _wide_parquet(source, "SCC", 2500)
+    _manifest(source, only)
+    database = tmp_path / "a2aj.sqlite"
+    corpus = LocalA2AJCorpus(tmp_path / "source", runtime_db=database)
+    calls = 0
+
+    def cancel_after_the_first_batch():
+        nonlocal calls
+        calls += 1
+        return calls > 2
+
+    with pytest.raises(InstallCancelled):
+        corpus.build_runtime_database(cancelled=cancel_after_the_first_batch)
+
+    assert not database.exists()
+    assert not database.with_suffix(database.suffix + ".new").exists()
+
+
 def test_packaged_a2aj_lifecycle_fresh_reboot_and_update(tmp_path):
     """Exercise the three AppData states used by a packaged desktop app."""
     source = tmp_path / "fixtures"

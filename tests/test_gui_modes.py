@@ -511,6 +511,127 @@ def test_a2aj_install_clears_cache_after_each_completed_corpus():
     )
 
 
+def _install_stub(corpus):
+    cancel = Mock()
+    cancel.is_set.return_value = False
+    return SimpleNamespace(
+        _a2aj_installing=False,
+        _a2aj_corpus_installed=lambda: True,
+        _a2aj_source_installed=lambda: True,
+        _a2aj_cancel=cancel,
+        _install_or_cancel_a2aj=Mock(),
+        a2aj_corpus_btn=Mock(),
+        a2aj_corpus_status_var=Mock(),
+        root=SimpleNamespace(after=Mock()),
+        _finish_a2aj_install=Mock(),
+        _show_a2aj_progress=Mock(),
+        _show_a2aj_build_progress=Mock(),
+    )
+
+
+class _ImmediateThread:
+    def __init__(self, target, daemon):
+        self.target = target
+
+    def start(self):
+        self.target()
+
+
+def _run_install(stub, corpus):
+    with patch.object(
+        gui.aqv.a2aj_client, "get_local_corpus", return_value=corpus
+    ), patch.object(
+        gui.aqv.a2aj_client, "clear_memory_cache"
+    ), patch.object(gui.threading, "Thread", _ImmediateThread):
+        gui.ALRQuoteVerifierGUI._start_a2aj_install(stub, confirmed=True)
+
+
+def test_an_update_that_changes_nothing_does_not_recompile_the_corpus():
+    """Recompiling eleven gigabytes into the same database is minutes wasted."""
+    corpus = Mock()
+    corpus.fetch_metadata.side_effect = (
+        SimpleNamespace(kind="cases", size=10),
+        SimpleNamespace(kind="laws", size=20),
+    )
+    corpus.bytes_to_download.side_effect = [0, 0]
+    corpus.install_or_update.return_value = None
+    corpus.runtime_ready.return_value = True
+    stub = _install_stub(corpus)
+
+    _run_install(stub, corpus)
+
+    corpus.build_runtime_database.assert_not_called()
+    stub._finish_a2aj_install.assert_not_called()  # posted through root.after
+    assert stub.root.after.call_args_list[-1].args[1] is stub._finish_a2aj_install
+
+
+def test_a_stale_database_is_still_rebuilt():
+    corpus = Mock()
+    corpus.fetch_metadata.side_effect = (
+        SimpleNamespace(kind="cases", size=10),
+        SimpleNamespace(kind="laws", size=20),
+    )
+    corpus.bytes_to_download.side_effect = [0, 0]
+    corpus.install_or_update.return_value = None
+    corpus.runtime_ready.return_value = False
+    stub = _install_stub(corpus)
+
+    _run_install(stub, corpus)
+
+    corpus.build_runtime_database.assert_called_once()
+
+
+def test_sqlite_import_reports_percent_instead_of_sitting_silent():
+    """Compiling the corpus is minutes long; silence reads as a hung app."""
+    corpus = Mock()
+    corpus.fetch_metadata.side_effect = (
+        SimpleNamespace(kind="cases", size=10),
+        SimpleNamespace(kind="laws", size=20),
+    )
+    corpus.bytes_to_download.side_effect = [0, 0]
+    corpus.install_or_update.return_value = None
+
+    def emit(progress=None, cancelled=None):
+        for completed in (0, 1, 2, 50, 50, 100):
+            progress(SimpleNamespace(
+                kind="cases", phase="index", completed=completed, total=100,
+                message="SCC",
+            ))
+        progress(SimpleNamespace(
+            kind="", phase="optimize", completed=100, total=100,
+            message="building indexes",
+        ))
+
+    corpus.build_runtime_database.side_effect = emit
+    corpus.runtime_ready.return_value = False
+    stub = _install_stub(corpus)
+
+    _run_install(stub, corpus)
+
+    posted = [
+        call.args for call in stub.root.after.call_args_list
+        if len(call.args) > 1 and call.args[1] is stub._show_a2aj_build_progress
+    ]
+    # Repeated 50s collapse — thousands of ticks would each be a Tk event —
+    # but the index build after the last byte still gets said out loud.
+    assert [args[2] for args in posted] == [0, 1, 2, 50, 100, 100]
+    assert posted[-1][3] == "building indexes"
+    assert (
+        corpus.build_runtime_database.call_args.kwargs["cancelled"]
+        is stub._a2aj_cancel.is_set
+    )
+
+
+def test_sqlite_import_status_names_the_dataset_being_read():
+    stub = SimpleNamespace(a2aj_corpus_status_var=Mock())
+
+    gui.ALRQuoteVerifierGUI._show_a2aj_build_progress(stub, 42, "BCSC")
+
+    stub.a2aj_corpus_status_var.set.assert_called_once_with(
+        "Preparing shared SQLite corpus · 42% · BCSC"
+    )
+
+
 def test_cli_smoke_hook_runs_engine_and_counts_live_transport_calls(capsys):
     argv = ["--input", "fixture", "--footnote-ids", "1"]
     transport = Mock(return_value=object())

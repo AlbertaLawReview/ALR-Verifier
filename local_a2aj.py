@@ -27,6 +27,13 @@ REPOSITORIES = {
     "cases": "a2aj/canadian-case-law",
     "laws": "a2aj/canadian-laws",
 }
+# Rows per import batch: a compromise between per-statement overhead and how
+# often the caller hears about progress. Larger SQLite pages were measured and
+# rejected — 32 KiB pages grow the finished database by 12.7% (more slack in
+# each document's last overflow page) and the build is bound by bytes written.
+IMPORT_BATCH_ROWS = 1000
+
+
 @dataclass(frozen=True)
 class CorpusFile:
     path: str
@@ -293,7 +300,12 @@ class LocalA2AJCorpus:
         ):
             if rebuild_runtime and not self._runtime_database_ready():
                 _progress(progress, kind, "index", remote.size, remote.size, "Preparing SQLite corpus")
-                self.build_runtime_database()
+                # Deliberately not forwarding `progress`: CorpusProgress
+                # measures one snapshot's bytes, and the import measures every
+                # installed Parquet, so interleaving the two would corrupt the
+                # download meter. Callers that want an import meter call
+                # build_runtime_database directly, as the GUI does.
+                self.build_runtime_database(cancelled=cancelled)
             return self.status(kind, remote)
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -371,7 +383,7 @@ class LocalA2AJCorpus:
                     progress, kind, "index", total, total,
                     "Preparing SQLite corpus", downloaded, to_download,
                 )
-                self.build_runtime_database()
+                self.build_runtime_database(cancelled=cancelled)
             _progress(
                 progress, kind, "complete", total, total, remote.revision,
                 downloaded, to_download,
@@ -574,7 +586,7 @@ class LocalA2AJCorpus:
                 "Install them and try again."
             ) from exc
 
-        sources: list[tuple[str, str, Path]] = []
+        sources: list[tuple[str, str, Path, int]] = []
         revisions: dict[str, str] = {}
         for kind in ("cases", "laws"):
             manifest = self._read_manifest(kind)
@@ -592,7 +604,7 @@ class LocalA2AJCorpus:
                         f"Installed A2AJ snapshot is incomplete: {kind}/{relative}"
                     )
                 dataset = PurePosixPath(relative).parts[0]
-                sources.append((kind, dataset, path))
+                sources.append((kind, dataset, path, expected_size))
         if not sources:
             raise RuntimeError("No installed A2AJ source snapshots were found")
 
@@ -633,19 +645,32 @@ class LocalA2AJCorpus:
                     return item
             return None
 
+        # Progress is weighted by Parquet bytes, not file count: the datasets
+        # differ by two orders of magnitude in size, so "file 23 of 53" moves
+        # in jumps that tell the user nothing about how long is left.
+        total_bytes = sum(size for *_, size in sources) or 1
+        done_bytes = 0
         try:
             sqlite.executescript(
                 "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; "
                 "PRAGMA temp_store=MEMORY;" + schema
             )
-            for ordinal, (kind, dataset_hint, path) in enumerate(sources, 1):
-                self._check_cancel(cancelled)
-                with duckdb.connect() as parquet:
-                    parquet.execute("PRAGMA disable_progress_bar")
+            # One DuckDB connection for the whole import rather than one per
+            # file. Worth little on its own — a connection is about 17ms — but
+            # the row counts below need somewhere to run.
+            with duckdb.connect() as parquet:
+                parquet.execute("PRAGMA disable_progress_bar")
+                for kind, dataset_hint, path, size in sources:
+                    self._check_cancel(cancelled)
+                    row_total = _parquet_row_count(parquet, path)
+                    rows_done = 0
                     cursor = parquet.execute("SELECT * FROM read_parquet(?)", [str(path)])
                     columns = [item[0] for item in cursor.description]
                     while True:
-                        batch = cursor.fetchmany(500)
+                        # Cancelling used to wait for the current file, which on
+                        # the largest dataset is tens of seconds of nothing.
+                        self._check_cancel(cancelled)
+                        batch = cursor.fetchmany(IMPORT_BATCH_ROWS)
                         if not batch:
                             break
                         documents = []
@@ -698,8 +723,23 @@ class LocalA2AJCorpus:
                             sqlite.executemany("INSERT INTO name_lookup VALUES (?,?)", names)
                             citation_count += len(citations)
                             name_count += len(names)
-                sqlite.commit()
-                _progress(progress, kind, "index", ordinal, len(sources), path.name)
+                        rows_done += len(batch)
+                        _progress(
+                            progress, kind, "index",
+                            done_bytes + (
+                                min(size, size * rows_done // row_total)
+                                if row_total else 0
+                            ),
+                            total_bytes, dataset_hint,
+                        )
+                    sqlite.commit()
+                    done_bytes += size
+                    _progress(
+                        progress, kind, "index", done_bytes, total_bytes, dataset_hint,
+                    )
+            _progress(
+                progress, "", "optimize", total_bytes, total_bytes, "building indexes",
+            )
             sqlite.execute("CREATE INDEX document_dataset_idx ON document(doc_type,dataset)")
             metadata = {
                 "schema_version": "3",
@@ -712,7 +752,11 @@ class LocalA2AJCorpus:
             }
             sqlite.executemany("INSERT INTO meta VALUES (?,?)", metadata.items())
             sqlite.commit()
-            sqlite.execute("ANALYZE")
+            # Every lookup this database serves is an equality probe on a
+            # primary key, so exhaustive statistics buy nothing; analysis_limit
+            # samples instead of scanning. Worth about a second of the sixteen
+            # this closing stage takes — the index build is the rest of it.
+            sqlite.executescript("PRAGMA analysis_limit=1000; ANALYZE;")
             sqlite.commit()
         except BaseException:
             sqlite.close()
@@ -831,6 +875,23 @@ def _safe_relative(value: str) -> Path:
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise ValueError(f"Unsafe A2AJ corpus path: {value!r}")
     return Path(*path.parts)
+
+
+def _parquet_row_count(connection, path: Path) -> int:
+    """Rows in a Parquet file, from its footer rather than by reading it.
+
+    Only used to place progress inside a file. ``count(*)`` costs a second on
+    the larger datasets; the footer costs a hundredth of that. A failure here
+    is not worth aborting an import over — the caller falls back to reporting
+    progress at file granularity.
+    """
+    try:
+        row = connection.execute(
+            "SELECT sum(num_rows) FROM parquet_file_metadata(?)", [str(path)]
+        ).fetchone()
+    except Exception:
+        return 0
+    return int(row[0]) if row and row[0] else 0
 
 
 def _progress(

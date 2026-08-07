@@ -2439,7 +2439,7 @@ class ALRQuoteVerifierGUI:
                 if corpus.legacy_source_ready():
                     self.root.after(
                         0, self.a2aj_corpus_status_var.set,
-                        "Moving existing A2AJ corpus to shared storageâ€¦",
+                        "Moving existing A2AJ corpus to shared storage…",
                     )
                     corpus.adopt_legacy_source()
                 snapshots = (
@@ -2478,11 +2478,38 @@ class ALRQuoteVerifierGUI:
                     aqv.a2aj_client.clear_memory_cache()
                     offset += snapshot.size
                     fetched += partition_fetched[0]
-                self.root.after(
-                    0, self.a2aj_corpus_status_var.set,
-                    "Preparing shared SQLite corpusâ€¦",
-                )
-                corpus.build_runtime_database(cancelled=self._a2aj_cancel.is_set)
+                # Only rebuild when the snapshots moved. This ran every time,
+                # so checking for updates and finding none still spent minutes
+                # recompiling eleven gigabytes into the same database.
+                if not corpus.runtime_ready():
+                    self.root.after(
+                        0, self.a2aj_corpus_status_var.set,
+                        "Preparing shared SQLite corpus…",
+                    )
+                    # Compiling the Parquet snapshots into SQLite is minutes of
+                    # work on the full corpus. Left silent it reads as a hang,
+                    # so report it, but only when the whole number of percent
+                    # moves: the import emits about 330 ticks and each one
+                    # otherwise costs a Tk event for no visible change.
+                    shown = [-1]
+
+                    def build_progress(item, seen=shown):
+                        percent = (
+                            int(item.completed * 100 / item.total)
+                            if item.total else 0
+                        )
+                        # The index build runs after the last byte is imported,
+                        # so it always lands on 100 and would be throttled away.
+                        if percent == seen[0] and item.phase != "optimize":
+                            return
+                        seen[0] = percent
+                        self.root.after(
+                            0, self._show_a2aj_build_progress, percent, item.message,
+                        )
+
+                    corpus.build_runtime_database(
+                        progress=build_progress, cancelled=self._a2aj_cancel.is_set,
+                    )
                 aqv.a2aj_client.clear_memory_cache()
                 self.root.after(0, self._finish_a2aj_install, True, "")
             except InstallCancelled:
@@ -2523,6 +2550,18 @@ class ALRQuoteVerifierGUI:
         percent = int(completed * 100 / total) if total else 0
         self.a2aj_corpus_status_var.set(
             f"Checking installed files · {percent}% · {partition}"
+        )
+
+    def _show_a2aj_build_progress(self, percent, dataset=""):
+        """Report the SQLite import, which runs long after the download ends.
+
+        The percentage is weighted by Parquet bytes rather than file count, so
+        it advances at a roughly even rate instead of stalling on the handful
+        of datasets that hold most of the corpus.
+        """
+        suffix = f" · {dataset}" if dataset else ""
+        self.a2aj_corpus_status_var.set(
+            f"Preparing shared SQLite corpus · {percent}%{suffix}"
         )
 
     def _finish_a2aj_install(self, success, message, paused=False):
